@@ -1,0 +1,23 @@
+mu_train: [20.0, 30.0, 40.0]
+mu_test: [15.0, 25.0]
+
+n_x: 64
+n_t: 100
+T_f: 1.0
+
+n_data_samples: 100
+n_physics_samples: 100
+data_batch_size: 50
+physics_batch_size: 50
+
+device: 1
+seed: 0
+task: "dual_frozen"
+
+latent_dim: 10
+max_epochs_data: 5
+max_epochs_physics: 5
+lr: 1e-3
+
+log_every_n_steps: 100
+ckpt_root: "/home/kendra/Code/Learning_Value_Function_Manifold/scripts/model_checkpoints"
