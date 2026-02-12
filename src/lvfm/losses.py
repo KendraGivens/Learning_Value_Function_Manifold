@@ -1,5 +1,27 @@
 import torch
-from lvfm.functions import phi_xt, g_ic, u_constrained
+from lvfm.functions import phi_xt, g_ic, u_constrained, compute_signed_distance, compute_hamiltonian
+
+# enforce hji variational inequality         
+def Air3Dphysics_loss_fn(model, batch, radius=0.25, ve=0.75, vp=0.75, wmax=3.0):
+    x, tau = batch
+    x = x.clone().detach().requires_grad_(True)
+    tau = tau.clone().detach().requires_grad_(True)
+
+    alpha, f_theta = model.get_latents(tau)
+    
+    D = model.decoder(x, alpha)
+    distance = compute_signed_distance(x, radius)
+    V = distance + tau * D
+
+    gradV = torch.autograd.grad(V.sum(), x, create_graph=True)[0]
+    grad_alpha_D = torch.autograd.grad(D.sum(), alpha, create_graph=True)[0]
+    D_tau = (grad_alpha_D * f_theta).sum(dim=1)
+    V_tau = D + tau * D_tau
+
+    H = compute_hamiltonian(x, gradV, ve=ve, vp=vp, wmax=wmax)
+    residual = torch.minimum(-V_tau + H, distance - V)
+
+    return torch.mean(residual**2)
 
 def data_loss_fn(model, batch):
     x, t, mu, y = batch

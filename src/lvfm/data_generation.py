@@ -1,5 +1,15 @@
 import torch
 
+# dynamics of the air3d system
+def Air3Ddynamics(x, w_e, w_p, ve=0.75, vp=0.75):
+    x1, x2, x3 = x.T
+    
+    dx1 = -ve + vp * torch.cos(x3) + w_e *x2
+    dx2 = vp * torch.sin(x3) - w_e * x1
+    dx3 = w_p - w_e
+
+    return torch.stack([dx1, dx2, dx3], dim=1)
+
 # maps x,t,mu to u (pde solution)
 def burgers_exact_eqn(x, t, mu):
     pi = torch.pi
