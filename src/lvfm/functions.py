@@ -8,7 +8,8 @@ def compute_hamiltonian(x, gradV, wmax=3.0, ve=0.75, vp=0.75):
 
     base = p1 * (-ve + vp * torch.cos(x3)) + p2 * (vp * torch.sin(x3))
     a = p1 * x2 - p2 * x1 - p3
-    H = base - wmax * torch.abs(a) + wmax * p3
+
+    H = base + wmax * torch.abs(a) - wmax * torch.abs(p3)
     return H
 
 # computes the signed distance to the target set

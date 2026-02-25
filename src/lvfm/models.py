@@ -1,11 +1,56 @@
 import torch
 import torch.nn as nn
 import lightning as L
+import math
 from torchdiffeq import odeint
 from lvfm.losses import data_loss_fn, physics_loss_fn, Air3Dphysics_loss_fn
 from lvfm.transforms import BurgersFourierFeatureTransform, Air3DFourierFeatureTransform
 from lvfm.functions import u_constrained, v_constrained, tau_curriculum
 
+class SineLayer(nn.Module):
+    def __init__(self, in_features, out_features, bias=True, is_first=False, omega_0=30.0):
+        super().__init__()
+        self.in_features = in_features
+        self.is_first = is_first
+        self.omega_0 = omega_0
+
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        self.init_weights()
+
+    def init_weights(self):
+        with torch.no_grad():
+            if self.is_first:
+                bound = 1.0 / self.in_features
+                self.linear.weight.uniform_(-bound, bound)
+            else:
+                bound = math.sqrt(6.0 / self.in_features) / self.omega_0
+                self.linear.weight.uniform_(-bound, bound)
+
+    def forward(self, x):
+        return torch.sin(self.omega_0 * self.linear(x))
+
+# decoder that takes in x and alpha and outputs u
+class Air3DSirenDecoder(nn.Module):
+    def __init__(self, latent_dim=10, hidden=512, n_hidden_layers=3, input_dim=3, omega_0_first=30.0, omega_0_hidden=30.0):
+        super().__init__()
+        in_dim = input_dim + latent_dim
+
+        layers = [SineLayer(in_dim, hidden, is_first=True, omega_0=omega_0_first)]
+        for _ in range(n_hidden_layers - 1):
+            layers.append(SineLayer(hidden, hidden, is_first=False, omega_0=omega_0_hidden))
+
+        self.model = nn.Sequential(*layers)
+
+        self.final = nn.Linear(hidden, 1)
+        with torch.no_grad():
+            bound = math.sqrt(6.0 / hidden) / omega_0_hidden
+            self.final.weight.uniform_(-bound, bound)
+
+    def forward(self, x, alpha):
+        inputs = torch.cat([x, alpha], dim=-1)
+        h = self.model(inputs)     
+        v = self.final(h)           
+        return v.squeeze(-1) 
 
 # decoder that takes in x and alpha and outputs u
 class Air3DDecoder(nn.Module):
@@ -63,41 +108,40 @@ class Air3DPNODE(nn.Module):
         return self.func(alpha, tau_vec) 
 
 class Air3DCNFROM(nn.Module):
-    def __init__(self, decoder: Air3DDecoder, pnode: Air3DPNODE, T=1.0, radius=0.25):
+    def __init__(self, decoder, pnode: Air3DPNODE, T=1.0, radius=0.25):
         super().__init__()
         self.decoder = decoder
         self.pnode = pnode
         self.T = T
         self.radius = radius
 
-    def get_latents(self, tau, steps=101):
-        device = tau.device
-        B = tau.shape[0]
+    def get_latents(self, tau, steps=33):
+            device = tau.device
+            B = tau.shape[0]
         
-        tau_grid = torch.linspace(0.0, self.T, steps, device=device)
-        alpha0 = torch.zeros(B, self.pnode.latent_dim, device=device)
-
-        def func(tau, a):
-            return self.pnode(tau,  a)
-            
-        alpha_trajectory = odeint(func, alpha0, tau_grid, method="rk4")
-
-        # interpolate to tau
-        dtau = tau_grid[1] - tau_grid[0]
-        indices = torch.floor(tau/dtau).long().clamp(0, steps-2)
-        trajectory = alpha_trajectory.permute(1, 0, 2)
-        batch_ids = torch.arange(tau.shape[0], device=device)
-        alpha_start = trajectory[batch_ids, indices]
-        alpha_end = trajectory[batch_ids, indices+1]
-
-        tau_start = tau_grid[indices]
-        ratio = ((tau-tau_start)/dtau).unsqueeze(-1)
-        alpha_interp = alpha_start + ratio * (alpha_end - alpha_start)
-
-        f_theta = self.pnode(tau, alpha_interp)
-
-        return alpha_interp, f_theta
-
+            tau_grid = torch.linspace(0.0, self.T, steps, device=device)
+            alpha0 = torch.zeros(B, self.pnode.latent_dim, device=device)
+        
+            def func(t_scalar, a):
+                return self.pnode(t_scalar, a)
+        
+            alpha_traj = odeint(func, alpha0, tau_grid, method="rk4")  # (steps, B, latent)
+        
+            dtau = tau_grid[1] - tau_grid[0]
+            idx = torch.floor(tau / dtau).long().clamp(0, steps - 2)
+        
+            batch_ids = torch.arange(B, device=device)
+            a0 = alpha_traj[idx, batch_ids, :]
+            a1 = alpha_traj[idx + 1, batch_ids, :]
+        
+            tau0 = tau_grid[idx]
+            r = ((tau - tau0) / dtau).unsqueeze(-1)
+        
+            alpha = a0 + r * (a1 - a0)
+            f_theta = self.pnode(tau, alpha)
+        
+            return alpha, f_theta
+    
     def forward(self, x, tau):
         alpha, _ = self.get_latents(tau)   
         v = v_constrained(self.decoder, x, tau, alpha, self.radius) 
@@ -254,8 +298,7 @@ class ModelWrapper(L.LightningModule):
 
     def configure_optimizers(self):
         params = [p for p in self.model.parameters() if p.requires_grad]
-        torch.optim.Adam(params, lr=self.lr)
-
+        return torch.optim.Adam(params, lr=self.lr)
 
     def on_train_epoch_end(self):
         if len(self.epoch_losses) > 0:

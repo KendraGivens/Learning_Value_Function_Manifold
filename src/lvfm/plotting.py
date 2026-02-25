@@ -7,22 +7,18 @@ import matplotlib.pyplot as plt
 from lvfm.data_generation import burgers_exact_eqn
 
 def plot_Air3D_loss(model, plot_dir):
-    fig = plt.figure(figsize=(8, 4))
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    losses = np.array(model.loss_hist, dtype=float)
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(losses)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Physics Loss")
+    ax.set_title("Training Loss (Air3D HJI)")
 
-    losses = np.array(model.loss_hist)
-    plt.figure()
-    plt.plot(losses)
-    plt.xlabel("Epoch")
-    plt.ylabel("Physics Loss")
-    plt.title("Training Loss (Air3D HJI)")
     fig.savefig(plot_dir / "loss_vs_epoch.png", dpi=200, bbox_inches="tight")
-    plt.close(fig) 
+    plt.close(fig)
     
 def plot_Air3D_heatmap(model, plot_dir):
-
-    plot_dir = Path(plot_dir)
-    plot_dir.mkdir(parents=True, exist_ok=True)
-
     cnf_trained = model.model
     cnf_trained.eval()
 
@@ -34,11 +30,7 @@ def plot_Air3D_heatmap(model, plot_dir):
         x2 = np.linspace(-1, 1, n, dtype=np.float32)
         X1, X2 = np.meshgrid(x1, x2, indexing="xy")
 
-        pts = np.stack([
-            X1.reshape(-1),
-            X2.reshape(-1),
-            np.full(X1.size, x3_val, dtype=np.float32)
-        ], axis=1)
+        pts = np.stack([X1.reshape(-1), X2.reshape(-1), np.full(X1.size, x3_val, dtype=np.float32)], axis=1)
 
         pts_t = torch.from_numpy(pts).to(device)
         tau_t = torch.full((pts_t.shape[0],), tau, device=device)
@@ -48,12 +40,8 @@ def plot_Air3D_heatmap(model, plot_dir):
 
     X1, X2, V = eval_value_slice(cnf_trained, tau=1.0)
     plt.figure()
-    plt.imshow(
-        V,
-        origin="lower",
-        extent=[-1, 1, -1, 1],
-        aspect="auto"
-    )
+    plt.imshow(V, origin="lower", extent=[-1, 1, -1, 1], aspect="auto")
+    
     plt.colorbar()
     plt.title("Value Function Slice (x3 = pi/2)")
     plt.xlabel("x1")
@@ -71,7 +59,6 @@ def plot_Air3D_heatmap(model, plot_dir):
     plt.savefig(plot_dir / "air3d_brt.png", dpi=200, bbox_inches="tight")
     plt.close()
 
-    
 def save_loss_plot(model, plot_dir):
     plot_dir = Path(plot_dir)
     plot_dir.mkdir(parents=True, exist_ok=True)

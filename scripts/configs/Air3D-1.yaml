@@ -2,7 +2,7 @@ n_samples: 65000
 batch_size: 256
 
 device: 1
-seed: 0
+seed: 1
 
 latent_dim: 10
 max_epochs: 1000

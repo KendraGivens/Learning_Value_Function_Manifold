@@ -4,7 +4,7 @@ from torch.utils.data import DataLoader
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor, RichProgressBar
 from lightning.pytorch.loggers import CSVLogger
 from lvfm.datasets import Air3DPhysicsDataset
-from lvfm.models import Air3DDecoder, Air3DPNODE, Air3DPNODEFunc, Air3DCNFROM, Air3DModelWrapper
+from lvfm.models import Air3DDecoder, Air3DSirenDecoder, Air3DPNODE, Air3DPNODEFunc, Air3DCNFROM, Air3DModelWrapper
 from lvfm.plotting import plot_Air3D_loss, plot_Air3D_heatmap
 from lvfm.callbacks import PlotEveryNEpochs
 
@@ -99,13 +99,18 @@ def main():
     log_every_n_steps = int(config["log_every_n_steps"])
     latent_dim = int(config["latent_dim"])
     max_epochs = int(config["max_epochs"])
-    lr = float(config.get("lr", 1e-3))
+    lr = float(config["lr"])
+    use_siren = config["use_siren"]
     
     L.seed_everything(seed, workers=True)
     
     train_dataset, train_loader = make_data_loader(config)
 
-    decoder = Air3DDecoder(latent_dim=latent_dim)
+    if use_siren:
+        decoder = Air3DSirenDecoder(latent_dim=latent_dim)
+    else:
+        decoder = Air3DDecoder(latent_dim=latent_dim)
+        
     pnode_func = Air3DPNODEFunc(latent_dim=latent_dim)
     pnode = Air3DPNODE(pnode_func, latent_dim=latent_dim)
     cnf = Air3DCNFROM(decoder, pnode)
@@ -121,7 +126,6 @@ def main():
 
     plot_dir = log_root / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
-
 
 if __name__ == "__main__":
     main()

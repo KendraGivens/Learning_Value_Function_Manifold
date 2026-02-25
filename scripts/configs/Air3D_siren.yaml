@@ -4,6 +4,8 @@ batch_size: 256
 device: 1
 seed: 0
 
+use_siren: True
+
 latent_dim: 10
 max_epochs: 1000
 lr: 1e-3
