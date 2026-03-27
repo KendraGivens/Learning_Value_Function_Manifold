@@ -1,181 +1,104 @@
 import torch
-from pathlib import Path
 import numpy as np
-import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from lvfm.data_generation import burgers_exact_eqn
-
-def plot_Air3D_loss(model, plot_dir):
-    plot_dir.mkdir(parents=True, exist_ok=True)
-    losses = np.array(model.loss_hist, dtype=float)
-    fig, ax = plt.subplots(figsize=(8, 4))
-    ax.plot(losses)
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Physics Loss")
-    ax.set_title("Training Loss (Air3D HJI)")
-
-    fig.savefig(plot_dir / "loss_vs_epoch.png", dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    
-def plot_Air3D_heatmap(model, plot_dir):
-    cnf_trained = model.model
-    cnf_trained.eval()
-
-    @torch.no_grad()
-    def eval_value_slice(cnf, tau=1.0, x3_val=np.pi/2, n=201):
-        device = next(cnf.parameters()).device
-
-        x1 = np.linspace(-1, 1, n, dtype=np.float32)
-        x2 = np.linspace(-1, 1, n, dtype=np.float32)
-        X1, X2 = np.meshgrid(x1, x2, indexing="xy")
-
-        pts = np.stack([X1.reshape(-1), X2.reshape(-1), np.full(X1.size, x3_val, dtype=np.float32)], axis=1)
-
-        pts_t = torch.from_numpy(pts).to(device)
-        tau_t = torch.full((pts_t.shape[0],), tau, device=device)
-
-        V = cnf(pts_t, tau_t).cpu().numpy().reshape(n, n)
-        return X1, X2, V
-
-    X1, X2, V = eval_value_slice(cnf_trained, tau=1.0)
-    plt.figure()
-    plt.imshow(V, origin="lower", extent=[-1, 1, -1, 1], aspect="auto")
-    
-    plt.colorbar()
-    plt.title("Value Function Slice (x3 = pi/2)")
-    plt.xlabel("x1")
-    plt.ylabel("x2")
-
-    plt.savefig(plot_dir / "air3d_value_heatmap.png", dpi=200, bbox_inches="tight")
-    plt.close()
-    plt.figure()
-    plt.contourf(X1, X2, (V <= 0).astype(float), levels=[0.5, 1.5])
-    plt.contour(X1, X2, V, levels=[0], colors="magenta")
-    plt.xlabel("x1")
-    plt.ylabel("x2")
-    plt.title("Backward Reachable Tube (V<=0)")
-
-    plt.savefig(plot_dir / "air3d_brt.png", dpi=200, bbox_inches="tight")
-    plt.close()
-
-def save_loss_plot(model, plot_dir):
-    plot_dir = Path(plot_dir)
-    plot_dir.mkdir(parents=True, exist_ok=True)
-
-    data_loss = np.asarray(model.epoch_loss_hist.get("data", []), dtype=float)
-    phys_loss = np.asarray(model.epoch_loss_hist.get("physics", []), dtype=float)
-    if data_loss.size + phys_loss.size == 0:
-        return
-
-    fig = plt.figure(figsize=(8, 4))
-    if data_loss.size:
-        plt.plot(data_loss, label="Data Loss")
-    if phys_loss.size:
-        x0 = len(data_loss)
-        plt.plot(np.arange(x0, x0 + len(phys_loss)), phys_loss, label="Physics Loss")
-    plt.yscale("log")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.legend()
-    plt.title("Loss vs Epoch")
-    fig.savefig(plot_dir / "loss_vs_epoch.png", dpi=200, bbox_inches="tight")
-    plt.close(fig)
+from matplotlib.lines import Line2D
+from pathlib import Path 
 
 @torch.no_grad()
-def plot_heatmap_compare(cnf_pre, cnf_fin, plot_dir, mu0=20.0, n_x=128, n_t=128, T=1.0):
-    plot_dir = Path(plot_dir)
-    plot_dir.mkdir(parents=True, exist_ok=True)
+def plot_linear_oscillator_2d(
+    model,
+    device,
+    tau,
+    x1_bounds=(-1.0, 1.0),
+    x2_bounds=(-1.0, 1.0),
+    nx=201,
+    chunk_size=4096,
+    scale_to_minus1_1=False,
+    T=1.0,
+    scale_time_to_01=True,
+    threshold=0.25,
+    show_terminal_target=True,
+    title=None,
+    show_heatmap=True,
+    save_path=None,
+    dpi=300,
+    show=False,
+):
+    model_was_training = model.training
+    model.eval()
 
-    device = next(cnf_fin.parameters()).device
-    x = torch.linspace(0.0, 2.0, n_x, device=device)
-    t = torch.linspace(0.0, T, n_t, device=device)
-    X, Tt = torch.meshgrid(x, t, indexing="xy")
+    x1 = np.linspace(x1_bounds[0], x1_bounds[1], nx)
+    x2 = np.linspace(x2_bounds[0], x2_bounds[1], nx)
+    X1, X2 = np.meshgrid(x1, x2, indexing="xy")
 
-    x_flat = X.reshape(-1)
-    t_flat = Tt.reshape(-1)
-    mu_flat = torch.full_like(x_flat, float(mu0))
+    pts_phys = np.stack([X1.reshape(-1), X2.reshape(-1)], axis=-1).astype(np.float32)
 
-    u_true = burgers_exact_eqn(X, Tt, torch.full_like(X, float(mu0)))
-    u_pre = cnf_pre(x_flat, t_flat, mu_flat).reshape_as(X)
-    u_fin = cnf_fin(x_flat, t_flat, mu_flat).reshape_as(X)
+    pts_net = pts_phys.copy()
+    if scale_to_minus1_1:
+        lo = np.array([x1_bounds[0], x2_bounds[0]], dtype=np.float32)
+        hi = np.array([x1_bounds[1], x2_bounds[1]], dtype=np.float32)
+        pts_net = 2.0 * (pts_net - lo) / (hi - lo) - 1.0
 
-    err_pre = (u_pre - u_true).abs()
-    err_fin = (u_fin - u_true).abs()
+    tau_net = tau / T if scale_time_to_01 else tau
+    tau_col = np.full((pts_net.shape[0], 1), tau_net, dtype=np.float32)
+    xt_np = np.concatenate([pts_net, tau_col], axis=-1)
 
-    def rel_L2(u_pred, u_true):
-        return (torch.norm(u_pred - u_true) / (torch.norm(u_true) + 1e-12)).item()
+    vals = []
+    for start in range(0, xt_np.shape[0], chunk_size):
+        end = min(start + chunk_size, xt_np.shape[0])
 
-    rel_pre = rel_L2(u_pre, u_true)
-    rel_fin = rel_L2(u_fin, u_true)
+        xt_chunk = torch.tensor(xt_np[start:end], dtype=torch.float32, device=device)
+        tau_phys_chunk = torch.full((end - start,), float(tau), dtype=torch.float32, device=device)
 
-    u_min = torch.min(torch.stack([u_true.min(), u_pre.min(), u_fin.min()])).item()
-    u_max = torch.max(torch.stack([u_true.max(), u_pre.max(), u_fin.max()])).item()
-    e_max = torch.max(torch.stack([err_pre.max(), err_fin.max()])).item()
+        V_chunk, _, _ = model.compute_value_at_xt(xt_chunk, tau_phys_chunk)
+        if isinstance(V_chunk, tuple):
+            V_chunk = V_chunk[0]
 
-    def show(ax, M, title, vmin=None, vmax=None):
-        im = ax.imshow(M.T.detach().cpu(), origin="lower", aspect="auto", extent=[x.min().item(), x.max().item(), t.min().item(), t.max().item()], vmin=vmin, vmax=vmax)
-        ax.set_xlabel("Space x")
-        ax.set_ylabel("Time t")
-        ax.set_title(title)
-        return im
+        vals.append(V_chunk.reshape(-1).detach().cpu().numpy())
 
-    fig, axs = plt.subplots(2, 3, figsize=(14, 7))
-    im0 = show(axs[0,0], u_true, "True u(x,t)", vmin=u_min, vmax=u_max)
-    show(axs[0,1], u_pre, f"Pretrained\nRel L2={rel_pre:.3f}", vmin=u_min, vmax=u_max)
-    show(axs[0,2], u_fin, f"Finetuned\nRel L2={rel_fin:.3f}", vmin=u_min, vmax=u_max)
+    V = np.concatenate(vals, axis=0).reshape(nx, nx)
 
-    axs[1,0].axis("off")
-    im4 = show(axs[1,1], err_pre, "Pretrained Error", vmin=0.0, vmax=e_max)
-    show(axs[1,2], err_fin, "Finetuned Error", vmin=0.0, vmax=e_max)
+    fig = plt.figure(figsize=(7, 6))
 
-    fig.colorbar(im0, ax=axs[0,:], fraction=0.02)
-    fig.colorbar(im4, ax=axs[1,1:], fraction=0.02)
-    plt.tight_layout()
-    fig.savefig(plot_dir / f"heatmap_compare_mu_{float(mu0):.1f}.png", dpi=200, bbox_inches="tight")
-    plt.close(fig)
+    if show_heatmap:
+        cf = plt.contourf(X1, X2, V, levels=40)
+        plt.colorbar(cf, label="V(x, tau)")
 
-@torch.no_grad()
-def plot_heatmap_physics(cnf, plot_dir, mu0=20.0, n_x=128, n_t=128, T=1.0):
-    plot_dir = Path(plot_dir)
-    plot_dir.mkdir(parents=True, exist_ok=True)
+    plt.contour(X1, X2, V, levels=[0.0], colors="red", linewidths=2.5, linestyles="-")
 
-    device = next(cnf.parameters()).device
-    x = torch.linspace(0.0, 2.0, n_x, device=device)
-    t = torch.linspace(0.0, T, n_t, device=device)
-    X, Tt = torch.meshgrid(x, t, indexing="xy")
+    if show_terminal_target:
+        th = np.linspace(0, 2 * np.pi, 400)
+        r = threshold
+        plt.plot(r * np.cos(th), r * np.sin(th), color="black", linestyle="--", linewidth=2.0)
 
-    x_flat = X.reshape(-1)
-    t_flat = Tt.reshape(-1)
-    mu_flat = torch.full_like(x_flat, float(mu0))
+    handles = [Line2D([0], [0], color="red", lw=2.5, linestyle="-", label="learned V=0")]
+    if show_terminal_target:
+        handles.append(Line2D([0], [0], color="black", lw=2.0, linestyle="--", label="true terminal target"))
+    plt.legend(handles=handles)
 
-    u_true = burgers_exact_eqn(X, Tt, torch.full_like(X, float(mu0)))
-    u_pred = cnf(x_flat, t_flat, mu_flat).reshape_as(X)
-    err = (u_pred - u_true).abs()
+    plt.xlabel("$x_1$")
+    plt.ylabel("$x_2$")
+    plt.xlim(x1_bounds)
+    plt.ylim(x2_bounds)
+    plt.gca().set_aspect("equal")
 
-    rel_l2 = (torch.norm(u_pred - u_true) / (torch.norm(u_true) + 1e-12)).item()
-
-    u_min = torch.min(torch.stack([u_true.min(), u_pred.min()])).item()
-    u_max = torch.max(torch.stack([u_true.max(), u_pred.max()])).item()
-    e_max = err.max().item()
-
-    def show(ax, M, title, vmin=None, vmax=None):
-        im = ax.imshow(M.T.detach().cpu(), origin="lower", aspect="auto",
-                       extent=[x.min().item(), x.max().item(), t.min().item(), t.max().item()],
-                       vmin=vmin, vmax=vmax)
-        ax.set_xlabel("Space x")
-        ax.set_ylabel("Time t")
-        ax.set_title(title)
-        return im
-
-    fig, axs = plt.subplots(1, 3, figsize=(14, 4))
-    im0 = show(axs[0], u_true, "True u(x,t)", vmin=u_min, vmax=u_max)
-    im1 = show(axs[1], u_pred, f"Physics Prediction\nRel L2={rel_l2:.3f}", vmin=u_min, vmax=u_max)
-    im2 = show(axs[2], err, "Abs Error", vmin=0.0, vmax=e_max)
-
-    fig.colorbar(im0, ax=axs[0], fraction=0.04)
-    fig.colorbar(im2, ax=axs[2], fraction=0.04)
+    if title is None:
+        title = f"Linear Oscillator Boundary at tau={tau:.2f}"
+    plt.title(title)
     plt.tight_layout()
 
-    fig.savefig(plot_dir / f"physics_result_mu_{float(mu0):.1f}.png", dpi=200, bbox_inches="tight")
-    plt.close(fig)
+    if save_path is None:
+        save_path = Path(f"linear_oscillator_tau_{tau:.2f}.png")
+    else:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+
+    plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    if model_was_training:
+        model.train()
