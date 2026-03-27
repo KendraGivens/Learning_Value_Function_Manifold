@@ -1,3 +1,6 @@
+import os
+os.environ["JAX_PLATFORMS"] = "cpu"
+
 import argparse
 from pathlib import Path
 import shutil
@@ -13,6 +16,7 @@ from lvfm.datasets import LinearOscillator2DDataset
 from lvfm.residuals import LinearOscillator2DResidual
 from lvfm.managers import LossManager
 from lvfm.models import Decoder, PNODE, INR_PNODE
+from lvfm.hj_solvers import solve_linear_oscillator_2d 
 from lvfm.plotting import plot_linear_oscillator_2d
 
 def to_namespace(d):
@@ -22,10 +26,22 @@ def load_yaml(path):
     with open(path, "r") as f:
         return yaml.safe_load(f)
 
+def save_checkpoint(path, model, optimizers, step=None, tau_max=None, cfg=None):
+    ckpt = {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dicts": {k: opt.state_dict() for k, opt in optimizers.items()},
+        "step": step,
+        "tau_max": tau_max
+    }
+    if cfg is not None: 
+        ckpt["cfg"] = vars(cfg) if hasattr(cfg, "__dict__") else cfg
+
+    torch.save(ckpt, path)
+
 def create_dataloader(cfg):    
     train_dataset = LinearOscillator2DDataset(
         num_batches=cfg.num_batches,
-        num_interior=cfg.num_interior,
+        num_interior= cfg.num_interior,
         num_terminal=cfg.num_terminal,
         T=cfg.T,
         x1_bounds=cfg.x1_bounds,
@@ -97,7 +113,7 @@ def main():
     p.add_argument("--cfg", required=True)
     args = p.parse_args()
     
-    cfg_path = Path("configs") / f"{args.cfg}.yaml"
+    cfg_path = Path("configs") / "linear_oscillator_2d" / f"{args.cfg}.yaml"
     cfg = load_yaml(cfg_path)
     cfg = to_namespace(cfg)
 
@@ -113,21 +129,23 @@ def main():
 
     run_name = args.cfg
     run_dir = Path("runs") / run_name
+    ckpt_dir = run_dir / "checkpoints"
     plot_dir = run_dir / "plots"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
     plot_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(cfg_path, run_dir /"config.yaml")
+    shutil.copy2(cfg_path, run_dir / "config.yaml")
             
     train_dataset, train_loader = create_dataloader(cfg)
     residual = create_residual(cfg)
     model = create_model(cfg, residual)
     optimizers = model.create_optimizers(lr=cfg.lr)
 
+    ground_truth_value_function = solve_linear_oscillator_2d(cfg.tau_schedule, 201, 201, cfg.x1_bounds, cfg.x2_bounds, cfg.u_bound, cfg.d_bound, cfg.omega, cfg.beta)
+    
     # pretraining
     train_dataset.set_tau_max(0.0)
     model.loss_manager.loss_weights = {"terminal": 1.0, "pinn": 0.0}
-    # pbar = trange(cfg.pretrain_steps, desc="pretrain tau=0.00")
     step = 0
-    print("training")
     while step < cfg.pretrain_steps:
         for batch in train_loader:
             for opt in optimizers.values():
@@ -142,28 +160,17 @@ def main():
 
             for opt in optimizers.values():
                 opt.step()
-
-            # if step % 50 == 0:
-            #     print(
-            #         f"pretrain step {step:4d} | "
-            #         f"loss={results['loss_train'].item():.3e} | "
-            #         f"term={results['loss_terminal'].item():.3e}"
-            #     )
-
-            # pbar.set_postfix(
-            #     loss=f"{results['loss_train'].item():.2e}",
-            #     term=f"{results['loss_terminal'].item():.2e}",
-            #     pinn=f"{results['loss_pinn'].item():.2e}",
-            #     )
-            # pbar.update(1)
             step += 1
             if step >= cfg.pretrain_steps:
                 break
-    # pbar.close()
+
+    save_checkpoint(ckpt_dir/"pretrain.pt", model, optimizers, step=step, tau_max=0.0, cfg=cfg)
+    gt_slice = np.array(ground_truth_value_function[0])
     plot_linear_oscillator_2d(
         model,
         device=cfg.device,
         tau=0.0,
+        gt_values=gt_slice,
         x1_bounds=cfg.x1_bounds,
         x2_bounds=cfg.x2_bounds,
         nx=201,
@@ -171,18 +178,15 @@ def main():
         scale_to_minus1_1=cfg.scale_to_minus1_1,
         T=cfg.T,
         scale_time_to_01=cfg.scale_time_to_01,
-        threshold=cfg.beta,
-        show_terminal_target=True,
-        title="Terminal pretraining (tau=0)",
-        save_path=plot_dir / "pretrain_tau_0.00.png",
+        title="Predicted vs Ground Truth at tau=0.00",
+        save_path=plot_dir / "compare_tau_0.00.png",
     )
-    print("finished pretraining")
+    
     # curriculum training
     model.loss_manager.loss_weights = {"terminal": 1.0, "pinn": 1.0}
-    for tau_max in cfg.tau_schedule:
+    for i, tau_max in enumerate(cfg.tau_schedule):
         train_dataset.set_tau_max(tau_max)
         print(f"\nTraining with tau_max = {tau_max:.2f}")
-        # pbar = trange(cfg.steps_per_stage, desc=f"tau={tau_max:.2f}")
         step = 0
         while step < cfg.steps_per_stage:
             for batch in train_loader:
@@ -198,27 +202,18 @@ def main():
 
                 for opt in optimizers.values():
                     opt.step()
-
-                # if step % 50 == 0:
-                #     print(
-                #         f"step {step:4d} | "
-                #         f"loss={results['loss_train'].item():.3e} | "
-                #         f"term={results['loss_terminal'].item():.3e} | "
-                #         f"pinn={results['loss_pinn'].item():.3e}"
-                #     )
-                # pbar.set_postfix(
-                #     loss=f"{results['loss_train'].item():.2e}",
-                #     term=f"{results['loss_terminal'].item():.2e}",
-                #     pinn=f"{results['loss_pinn'].item():.2e}",
-                #     )
-                # pbar.update(1)
+                    
                 step += 1
                 if step >= cfg.steps_per_stage:
                     break
+        save_checkpoint(ckpt_dir/f"tau_{tau_max:.2f}.pt", model, optimizers, step=step, tau_max=tau_max, cfg=cfg)  
+        
+        gt_slice = np.array(ground_truth_value_function[i + 1])
         plot_linear_oscillator_2d(
             model,
             device=cfg.device,
             tau=tau_max,
+            gt_values=gt_slice,
             x1_bounds=cfg.x1_bounds,
             x2_bounds=cfg.x2_bounds,
             nx=201,
@@ -226,13 +221,8 @@ def main():
             scale_to_minus1_1=cfg.scale_to_minus1_1,
             T=cfg.T,
             scale_time_to_01=cfg.scale_time_to_01,
-            threshold=cfg.beta,
-            show_terminal_target=(tau_max == 0.0),
-            title=f"Learned boundary at tau={tau_max:.2f}",
-            save_path=plot_dir / f"tau_{tau_max:.2f}.png",
+            title=f"Predicted vs Ground Truth at tau={tau_max:.2f}",
+            save_path=plot_dir / f"compare_tau_{tau_max:.2f}.png",
         )
-    # pbar.close()
-    print("finished curriculum")
-    
 if __name__ == "__main__":
     main()

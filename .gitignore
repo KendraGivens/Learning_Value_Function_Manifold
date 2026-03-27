@@ -1,6 +1,6 @@
 notebooks/lightning_logs
 scripts/model_checkpoints
-scripts/logs
+scripts/runs
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
