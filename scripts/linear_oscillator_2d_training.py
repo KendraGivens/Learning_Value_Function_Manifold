@@ -111,6 +111,7 @@ def create_model(cfg, residual):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--cfg", required=True)
+    p.add_argument("--device", type=int)
     args = p.parse_args()
     
     cfg_path = Path("configs") / "linear_oscillator_2d" / f"{args.cfg}.yaml"
@@ -124,11 +125,12 @@ def main():
     torch.cuda.manual_seed_all(0)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    
-    cfg.device = torch.device("cuda")
+
+    device_idx = 0 if args.device is None else args.device
+    cfg.device = torch.device(f"cuda:{device_idx}")
 
     run_name = args.cfg
-    run_dir = Path("runs") / run_name
+    run_dir = Path("linear_oscillator_2d/runs") / run_name
     ckpt_dir = run_dir / "checkpoints"
     plot_dir = run_dir / "plots"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -165,27 +167,20 @@ def main():
                 break
 
     save_checkpoint(ckpt_dir/"pretrain.pt", model, optimizers, step=step, tau_max=0.0, cfg=cfg)
-    gt_slice = np.array(ground_truth_value_function[0])
-    plot_linear_oscillator_2d(
-        model,
-        device=cfg.device,
-        tau=0.0,
-        gt_values=gt_slice,
-        x1_bounds=cfg.x1_bounds,
-        x2_bounds=cfg.x2_bounds,
-        nx=201,
-        chunk_size=4096,
-        scale_to_minus1_1=cfg.scale_to_minus1_1,
-        T=cfg.T,
-        scale_time_to_01=cfg.scale_time_to_01,
-        title="Predicted vs Ground Truth at tau=0.00",
-        save_path=plot_dir / "compare_tau_0.00.png",
-    )
+    gt_slice = np.array(ground_truth_value_function[0]).T
+    plot_linear_oscillator_2d(model, device=cfg.device, tau=0.0, gt_values=gt_slice, x1_bounds=cfg.x1_bounds, x2_bounds=cfg.x2_bounds, nx=201, chunk_size=4096, scale_to_minus1_1=cfg.scale_to_minus1_1, T=cfg.T, scale_time_to_01=cfg.scale_time_to_01, title="Predicted vs Ground Truth at tau=0.00", save_path=plot_dir / "compare_tau_0.00.png")
     
     # curriculum training
     model.loss_manager.loss_weights = {"terminal": 1.0, "pinn": 1.0}
     for i, tau_max in enumerate(cfg.tau_schedule):
         train_dataset.set_tau_max(tau_max)
+        # if i < 2:
+        #     model.loss_manager.loss_weights = {"terminal": 5.0, "pinn": 1.0}
+        # elif i < 4:
+        #     model.loss_manager.loss_weights = {"terminal": 2.0, "pinn": 1.0}
+        # else:
+        #     model.loss_manager.loss_weights = {"terminal": 1.0, "pinn": 1.0}
+
         print(f"\nTraining with tau_max = {tau_max:.2f}")
         step = 0
         while step < cfg.steps_per_stage:
@@ -208,21 +203,8 @@ def main():
                     break
         save_checkpoint(ckpt_dir/f"tau_{tau_max:.2f}.pt", model, optimizers, step=step, tau_max=tau_max, cfg=cfg)  
         
-        gt_slice = np.array(ground_truth_value_function[i + 1])
-        plot_linear_oscillator_2d(
-            model,
-            device=cfg.device,
-            tau=tau_max,
-            gt_values=gt_slice,
-            x1_bounds=cfg.x1_bounds,
-            x2_bounds=cfg.x2_bounds,
-            nx=201,
-            chunk_size=4096,
-            scale_to_minus1_1=cfg.scale_to_minus1_1,
-            T=cfg.T,
-            scale_time_to_01=cfg.scale_time_to_01,
-            title=f"Predicted vs Ground Truth at tau={tau_max:.2f}",
-            save_path=plot_dir / f"compare_tau_{tau_max:.2f}.png",
-        )
+        gt_slice = np.array(ground_truth_value_function[i + 1]).T
+        plot_linear_oscillator_2d( model, device=cfg.device, tau=tau_max, gt_values=gt_slice, x1_bounds=cfg.x1_bounds, x2_bounds=cfg.x2_bounds, nx=201, chunk_size=4096, scale_to_minus1_1=cfg.scale_to_minus1_1, T=cfg.T, scale_time_to_01=cfg.scale_time_to_01, title=f"Predicted vs Ground Truth at tau={tau_max:.2f}", save_path=plot_dir / f"compare_tau_{tau_max:.2f}.png")
+
 if __name__ == "__main__":
     main()

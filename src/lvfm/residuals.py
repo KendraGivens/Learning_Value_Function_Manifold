@@ -59,12 +59,11 @@ class LinearOscillator2DResidual(nn.Module):
         dV_dxt, dV_dalpha = torch.autograd.grad(V, [xt, latent], grad_outputs=torch.ones_like(V), retain_graph=True, create_graph=True)
 
         spatial_grad_net = dV_dxt[:, :2]
-        tau_grad_net = (dV_dalpha * dlatent).sum(dim=-1)
+        tau_grad_phys = (dV_dalpha * dlatent).sum(dim=-1)
 
         x_net = xt[:, :2]
         x_phys = self._unscale_x(x_net)
         spatial_grad_phys = self._unscale_spatial_gradient(spatial_grad_net)
-        tau_grad_phys = self._unscale_time_gradient(tau_grad_net)
 
         level_set_x = self.target_function(x_phys)
         hamiltonian = self.compute_hamiltonian(x_phys, spatial_grad_phys)
