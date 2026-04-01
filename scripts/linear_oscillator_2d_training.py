@@ -130,8 +130,8 @@ def main():
     cfg.device = torch.device(f"cuda:{device_idx}")
 
     run_name = args.cfg
-    run_dir = Path("linear_oscillator_2d/runs") / run_name
-    ckpt_dir = run_dir / "checkpoints"
+    run_dir = Path("runs/linear_oscillator_2d") / run_name
+    ckpt_dir = run_dir / "ckpts"
     plot_dir = run_dir / "plots"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     plot_dir.mkdir(parents=True, exist_ok=True)
@@ -174,13 +174,6 @@ def main():
     model.loss_manager.loss_weights = {"terminal": 1.0, "pinn": 1.0}
     for i, tau_max in enumerate(cfg.tau_schedule):
         train_dataset.set_tau_max(tau_max)
-        # if i < 2:
-        #     model.loss_manager.loss_weights = {"terminal": 5.0, "pinn": 1.0}
-        # elif i < 4:
-        #     model.loss_manager.loss_weights = {"terminal": 2.0, "pinn": 1.0}
-        # else:
-        #     model.loss_manager.loss_weights = {"terminal": 1.0, "pinn": 1.0}
-
         print(f"\nTraining with tau_max = {tau_max:.2f}")
         step = 0
         while step < cfg.steps_per_stage:

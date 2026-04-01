@@ -62,8 +62,12 @@ def plot_linear_oscillator_2d(
     if gt_values is not None and gt_values.shape != (nx, nx):
         raise ValueError(f"gt_values must have shape {(nx, nx)}, got {gt_values.shape}")
 
-    ncols = 2 if gt_values is not None else 1
-    fig, axes = plt.subplots(1, ncols, figsize=(12, 5) if ncols == 2 else (7, 6))
+    abs_error = None
+    if gt_values is not None:
+        abs_error = np.abs(V_pred - gt_values)
+
+    ncols = 3 if gt_values is not None else 1
+    fig, axes = plt.subplots(1, ncols, figsize=(18, 5) if ncols == 3 else (7, 6))
     if ncols == 1:
         axes = [axes]
 
@@ -97,8 +101,8 @@ def plot_linear_oscillator_2d(
     ax.set_aspect("equal")
     ax.set_title(f"Predicted at tau={tau:.2f}")
 
-    # Right panel: ground truth
     if gt_values is not None:
+        # Middle panel: ground truth
         ax = axes[1]
         if show_heatmap:
             cf_gt = ax.contourf(X1, X2, gt_values, levels=levels, vmin=vmin, vmax=vmax)
@@ -113,6 +117,22 @@ def plot_linear_oscillator_2d(
         ax.set_aspect("equal")
         ax.set_title(f"Ground Truth at tau={tau:.2f}")
 
+        # Right panel: absolute error
+        ax = axes[2]
+        err_levels = np.linspace(0.0, max(abs_error.max(), 1e-8), 40)
+        cf_err = ax.contourf(X1, X2, abs_error, levels=err_levels)
+        fig.colorbar(cf_err, ax=ax, label=r"$|V_{\mathrm{pred}} - V_{\mathrm{gt}}|$")
+
+        ax.contour(X1, X2, V_pred, levels=[0.0], colors="red", linewidths=2.0, linestyles="-")
+        ax.contour(X1, X2, gt_values, levels=[0.0], colors="black", linewidths=2.0, linestyles="--")
+
+        ax.set_xlabel("$x_1$")
+        ax.set_ylabel("$x_2$")
+        ax.set_xlim(x1_bounds)
+        ax.set_ylim(x2_bounds)
+        ax.set_aspect("equal")
+        ax.set_title("Absolute Error")
+
     handles = [Line2D([0], [0], color="red", lw=2.5, linestyle="-", label="learned V=0")]
     if gt_values is not None:
         handles.append(Line2D([0], [0], color="black", lw=2.5, linestyle="--", label="ground-truth V=0"))
@@ -120,7 +140,7 @@ def plot_linear_oscillator_2d(
     if title is None:
         title = f"Predicted vs Ground Truth at tau={tau:.2f}"
     fig.suptitle(title, y=0.99)
-    
+
     if gt_values is not None:
         mae, iou = compute_metrics(V_pred, gt_values)
         metric_text = f"MAE: {mae:.4e}    BRT Overlap: {iou:.4f}"
@@ -131,14 +151,14 @@ def plot_linear_oscillator_2d(
             ha="center",
             va="center",
         )
-    
+
     fig.legend(
         handles=handles,
         loc="upper center",
         ncol=len(handles),
         bbox_to_anchor=(0.5, 0.915),
     )
-    
+
     fig.tight_layout(rect=[0, 0, 1, 0.84])
 
     if save_path is None:

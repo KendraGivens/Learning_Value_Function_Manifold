@@ -39,18 +39,7 @@ class LinearOscillator2DDataset(Dataset):
         if self.tau_max <= 0:
             return torch.zeros(n, 1)
         return self.tau_max * torch.rand(n, 1)
-
-    # def _sample_tau_phys(self, n):
-    #     if self.tau_max <= 0:
-    #         return torch.zeros(n, 1)
-    #     n_beta = int(0.7*n)
-    #     n_uniform = n - n_beta
-    #     tau_beta = self.tau_max * torch.distributions.Beta(0.5, 2.0).sample((n_beta, 1))
-    #     tau_uniform = self.tau_max * torch.rand(n_uniform, 1)
-    #     tau = torch.cat([tau_beta, tau_uniform], dim=0)
-    #     tau = tau[torch.randperm(n)]
-    #     return tau
-
+        
     # normalize tau to be between 0 and 1
     def _scale_tau(self, tau_phys):
         if not self.scale_time_to_0_1:
