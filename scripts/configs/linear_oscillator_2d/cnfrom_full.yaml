@@ -1,12 +1,12 @@
 coordinate_dim: 2
-latent_dim: 128
+latent_dim: 16
 
-decoder_hidden_dim: 32
-pnode_hidden_dim: 128
+decoder_hidden_dim: 128
+pnode_hidden_dim: 64
 decoder_num_layers: 3
 input_scale: 16.0
 
-method: dopri5
+method: rk4
 rtol: 1.0e-7
 atol: 1.0e-9
 
@@ -23,6 +23,8 @@ num_batches: 1000
 num_interior: 4096
 num_terminal: 4096
 
+num_unique_taus: 16
+
 scale_to_minus1_1: true
 scale_time_to_01: true
 
@@ -30,4 +32,4 @@ lr: 1.0e-4
 net_type: siren
 pretrain_steps: 2000
 steps_per_stage: 500
-tau_schedule: [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.50, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.0]
+tau_schedule: [0.05, 0.1, 0.2, 0.4, 0.7, 1.0]

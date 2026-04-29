@@ -1,0 +1,44 @@
+coordinate_dim: 3
+latent_dim: 64
+
+decoder_hidden_dim: 512
+pnode_hidden_dim: 128
+decoder_num_layers: 3
+
+net_type: siren
+omega0: 30.0
+input_scale: 16.0   
+
+method: dopri5
+rtol: 1.0e-5
+atol: 1.0e-7
+
+T: 1.0
+vp: 0.75
+ve: 0.75
+u_bound: 3.0
+d_bound: 3.0
+beta: 0.25
+
+x_bounds: [-1.0, 1.0]
+y_bounds: [-1.0, 1.0]
+psi_bounds: [-3.14159265, 3.14159265]
+psi_slice: 1.57079632679
+
+x_discretization: 101
+y_discretization: 101
+psi_discretization: 101
+
+num_batches: 1000
+num_interior: 10000
+num_terminal: 10000
+
+scale_to_minus1_1: true
+scale_time_to_01: true
+
+lr: 1.0e-4
+pretrain_steps: 2000
+steps_per_stage: 2000
+pnode_warmup_steps: 5000
+tau_schedule: [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+num_unique_taus: 4096

@@ -15,9 +15,9 @@ from torchdiffeq import odeint
 from lvfm.datasets import LinearOscillator2DDataset
 from lvfm.residuals import LinearOscillator2DResidual
 from lvfm.managers import LossManager
-from lvfm.models import Decoder, PNODE, INR_PNODE
+from lvfm.models import DeepReachModel, DeepReachExact
 from lvfm.hj_solvers import solve_linear_oscillator_2d 
-from lvfm.plotting import plot_linear_oscillator_2d
+from lvfm.plotting import plot_linear_oscillator_2d_deepreach
 
 def to_namespace(d):
     return SimpleNamespace(**d)
@@ -26,10 +26,10 @@ def load_yaml(path):
     with open(path, "r") as f:
         return yaml.safe_load(f)
 
-def save_checkpoint(path, model, optimizers, step=None, tau_max=None, cfg=None):
+def save_checkpoint(path, model, optimizer, step=None, tau_max=None, cfg=None):
     ckpt = {
         "model_state_dict": model.state_dict(),
-        "optimizer_state_dicts": {k: opt.state_dict() for k, opt in optimizers.items()},
+        "optimizer_state_dict": optimizer.state_dict(),
         "step": step,
         "tau_max": tau_max
     }
@@ -69,8 +69,8 @@ def create_residual(cfg):
             x1_bounds=cfg.x1_bounds,
             x2_bounds=cfg.x2_bounds,
             scale_to_minus1_1=cfg.scale_to_minus1_1,
-            scale_time_to_01=cfg.scale_time_to_01,
-        )
+            scale_time_to_01=cfg.scale_time_to_01
+    )
     return residual
 
 def create_model(cfg, residual):
@@ -78,35 +78,47 @@ def create_model(cfg, residual):
         residual=residual,
         loss_weights={"terminal": 1.0, "pinn": 1.0},
     )
-    
-    decoder = Decoder(
-        hidden_dim=cfg.decoder_hidden_dim,
-        latent_dim=cfg.latent_dim,
-        coordinate_dim=cfg.coordinate_dim,
-        out_dim=1,
-        num_layers=cfg.decoder_num_layers,
-        net_type=cfg.net_type,   
-        input_scale=cfg.input_scale,
-    )
-    
-    pnode = PNODE(
-        latent_dim=cfg.latent_dim,
-        hidden_dim=cfg.pnode_hidden_dim,
-    )
-    
-    model = INR_PNODE(
-        latent_dim=cfg.latent_dim,
-        decoder=decoder,
-        pnode=pnode,
-        loss_manager=loss_manager,
-        ode_solver=odeint,
-        method=cfg.method,
-        rtol=cfg.rtol,
-        atol=cfg.atol,
-        device=cfg.device,
+
+    raw_model = DeepReachModel(
+        in_dim=cfg.in_dim,
+        hidden_dim=cfg.hidden_dim,
+        num_layers=cfg.num_layers,
+        omega0=cfg.omega0,
     ).to(cfg.device)
 
-    return model
+    model = DeepReachExact(
+        backbone=raw_model,
+        residual=residual,
+        coordinate_dim=2,  
+        value_var=0.5,
+        value_normto=0.02,
+    ).to(cfg.device)
+
+    return model, loss_manager
+
+def compute_losses(model, loss_manager, batch, device):
+    xt_interior = batch["xt_interior"].to(device).float().requires_grad_(True)
+    xt_terminal = batch["xt_terminal"].to(device).float()
+    x_terminal_phys = batch["x_terminal_phys"].to(device).float()
+
+    loss_dict = loss_manager.compute_losses(
+        model=model,
+        xt_interior=xt_interior,
+        xt_terminal=xt_terminal,
+        x_terminal_phys=x_terminal_phys,
+        V=None,
+        V_terminal=None,
+        latent=None,
+        dlatent=None,
+        deepreach=True,
+    )
+
+    loss_train = (
+        loss_manager.loss_weights["terminal"] * loss_dict["loss_terminal"]
+        + loss_manager.loss_weights["pinn"] * loss_dict["loss_pinn"]
+    )
+    loss_dict["loss_train"] = loss_train
+    return loss_dict
 
 def main():
     p = argparse.ArgumentParser()
@@ -139,65 +151,57 @@ def main():
             
     train_dataset, train_loader = create_dataloader(cfg)
     residual = create_residual(cfg)
-    model = create_model(cfg, residual)
-    optimizers = model.create_optimizers(lr=cfg.lr)
+    model, loss_manager = create_model(cfg, residual)
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
 
     ground_truth_value_function = solve_linear_oscillator_2d(cfg.tau_schedule, 201, 201, cfg.x1_bounds, cfg.x2_bounds, cfg.u_bound, cfg.d_bound, cfg.omega, cfg.beta)
     
     # pretraining
     train_dataset.set_tau_max(0.0)
-    model.loss_manager.loss_weights = {"terminal": 1.0, "pinn": 0.0}
+    loss_manager.loss_weights = {"terminal": 1.0, "pinn": 0.0}
     step = 0
     while step < cfg.pretrain_steps:
         for batch in train_loader:
-            for opt in optimizers.values():
-                opt.zero_grad()
+            optimizer.zero_grad()
 
-            results = model.compute_losses(batch, mode="train")
+            results = compute_losses(model, loss_manager, batch, cfg.device)
             results["loss_train"].backward()
 
-            torch.nn.utils.clip_grad_norm_(model.decoder.parameters(), max_norm=1.0)
-            torch.nn.utils.clip_grad_norm_(model.pnode.parameters(), max_norm=1.0)
-            torch.nn.utils.clip_grad_norm_([model.alpha0], max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-            for opt in optimizers.values():
-                opt.step()
+            optimizer.step()
             step += 1
             if step >= cfg.pretrain_steps:
                 break
 
-    save_checkpoint(ckpt_dir/"pretrain.pt", model, optimizers, step=step, tau_max=0.0, cfg=cfg)
+    save_checkpoint(ckpt_dir/"pretrain.pt", model, optimizer, step=step, tau_max=0.0, cfg=cfg)
     gt_slice = np.array(ground_truth_value_function[0]).T
-    plot_linear_oscillator_2d(model, device=cfg.device, tau=0.0, gt_values=gt_slice, x1_bounds=cfg.x1_bounds, x2_bounds=cfg.x2_bounds, nx=201, chunk_size=4096, scale_to_minus1_1=cfg.scale_to_minus1_1, T=cfg.T, scale_time_to_01=cfg.scale_time_to_01, title="Predicted vs Ground Truth at tau=0.00", save_path=plot_dir / "compare_tau_0.00.png")
+    plot_linear_oscillator_2d_deepreach(model, device=cfg.device, tau=0.0, gt_values=gt_slice, x1_bounds=cfg.x1_bounds, x2_bounds=cfg.x2_bounds, nx=201, chunk_size=4096, scale_to_minus1_1=cfg.scale_to_minus1_1, T=cfg.T, scale_time_to_01=cfg.scale_time_to_01, title="Predicted vs Ground Truth at tau=0.00", save_path=plot_dir / "compare_tau_0.00.png")
     
     # curriculum training
-    model.loss_manager.loss_weights = {"terminal": 1.0, "pinn": 1.0}
+    loss_manager.loss_weights = {"terminal": 1.0, "pinn": 1.0}
     for i, tau_max in enumerate(cfg.tau_schedule):
         train_dataset.set_tau_max(tau_max)
         print(f"\nTraining with tau_max = {tau_max:.2f}")
         step = 0
         while step < cfg.steps_per_stage:
             for batch in train_loader:
-                for opt in optimizers.values():
-                    opt.zero_grad()
+                optimizer.zero_grad()
 
-                results = model.compute_losses(batch, mode="train")
+                results = compute_losses(model, loss_manager, batch, cfg.device)
                 results["loss_train"].backward()
 
-                torch.nn.utils.clip_grad_norm_(model.decoder.parameters(), max_norm=1.0)
-                torch.nn.utils.clip_grad_norm_(model.pnode.parameters(), max_norm=1.0)
-                torch.nn.utils.clip_grad_norm_([model.alpha0], max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-                for opt in optimizers.values():
-                    opt.step()
+                optimizer.step()
                     
                 step += 1
                 if step >= cfg.steps_per_stage:
                     break
-        save_checkpoint(ckpt_dir/f"tau_{tau_max:.2f}.pt", model, optimizers, step=step, tau_max=tau_max, cfg=cfg)  
+        save_checkpoint(ckpt_dir/f"tau_{tau_max:.2f}.pt", model, optimizer, step=step, tau_max=tau_max, cfg=cfg)  
         
         gt_slice = np.array(ground_truth_value_function[i + 1]).T
-        plot_linear_oscillator_2d( model, device=cfg.device, tau=tau_max, gt_values=gt_slice, x1_bounds=cfg.x1_bounds, x2_bounds=cfg.x2_bounds, nx=201, chunk_size=4096, scale_to_minus1_1=cfg.scale_to_minus1_1, T=cfg.T, scale_time_to_01=cfg.scale_time_to_01, title=f"Predicted vs Ground Truth at tau={tau_max:.2f}", save_path=plot_dir / f"compare_tau_{tau_max:.2f}.png")
+        plot_linear_oscillator_2d_deepreach(model, device=cfg.device, tau=tau_max, gt_values=gt_slice, x1_bounds=cfg.x1_bounds, x2_bounds=cfg.x2_bounds, nx=201, chunk_size=4096, scale_to_minus1_1=cfg.scale_to_minus1_1, T=cfg.T, scale_time_to_01=cfg.scale_time_to_01, title=f"Predicted vs Ground Truth at tau={tau_max:.2f}", save_path=plot_dir / f"compare_tau_{tau_max:.2f}.png")
 
 if __name__ == "__main__":
     main()

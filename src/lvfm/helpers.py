@@ -11,3 +11,6 @@ def compute_metrics(V_pred, V_gt):
     iou = intersection / union if union > 0 else 1.0
 
     return float(mae), float(iou)
+
+def squeeze_last(x):
+    return x.squeeze(-1) if x.ndim > 1 and x.shape[-1] == 1 else x

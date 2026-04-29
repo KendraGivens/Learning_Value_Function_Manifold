@@ -30,23 +30,45 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.model(x) 
 
-# takes in current time and latent state 
-# outputs the time derivative of latent state
 class PNODE(nn.Module):
-    def __init__(self, latent_dim, hidden_dim, activation_fn=Swish):
+    def __init__(self, latent_dim, hidden_dim, num_layers=3, omega0=15.0):
         super().__init__()
-        self.model = MLP(in_dim=latent_dim+1, hidden_dim=hidden_dim, activation_fn=activation_fn, out_dim=latent_dim)
+        self.latent_dim = latent_dim
+
+        layers = [SirenLayer(latent_dim + 1, hidden_dim, omega0=omega0, is_first=True)]
+        for _ in range(num_layers - 1):
+            layers.append(SirenLayer(hidden_dim, hidden_dim, omega0=omega0, is_first=False))
+
+        self.hidden = nn.Sequential(*layers)
+        self.final = nn.Linear(hidden_dim, latent_dim)
 
     def forward(self, t, latent_state):
         if not torch.is_tensor(t):
             t = torch.tensor(t, dtype=latent_state.dtype, device=latent_state.device)
+
         if t.ndim == 0:
             t_expanded = t.expand(latent_state.shape[:-1] + (1,))
         else:
             t_expanded = t[..., None].expand(latent_state.shape[:-1] + (1,))
-        inputs = torch.cat([latent_state, t_expanded], dim=-1)
-        return self.model(inputs)
 
+        inputs = torch.cat([latent_state, t_expanded], dim=-1)
+        out = self.hidden(inputs)
+        return self.final(out)
+
+# class PNODE(nn.Module):
+#     def __init__(self, latent_dim, hidden_dim, num_layers=3, activation_fn=Swish):
+#         super().__init__()
+#         self.model = MLP(in_dim=latent_dim+1, hidden_dim=hidden_dim, activation_fn=activation_fn, out_dim=latent_dim)
+
+#     def forward(self, t, latent_state):
+#         if not torch.is_tensor(t):
+#             t = torch.tensor(t, dtype=latent_state.dtype, device=latent_state.device)
+#         if t.ndim == 0:
+#             t_expanded = t.expand(latent_state.shape[:-1] + (1,))
+#         else:
+#             t_expanded = t[..., None].expand(latent_state.shape[:-1] + (1,))
+#         inputs = torch.cat([latent_state, t_expanded], dim=-1)
+#         return self.model(inputs)
 
 # takes in inputs and latent state alpha
 # returns the learned linear projection of the inputs and latent state
@@ -176,9 +198,57 @@ class Decoder(nn.Module):
     def forward(self, x, latents):
         return self.model(x, latents)
 
+class DeepReachModel(nn.Module):
+    def __init__(self, in_dim=3, hidden_dim=512, num_layers=4, omega0=30.0):
+        super().__init__()
+        layers = [SirenLayer(in_dim, hidden_dim, omega0=omega0, is_first=True)]
+        for _ in range(num_layers-1):
+            layers.append(SirenLayer(hidden_dim, hidden_dim, omega0=omega0, is_first=False))
+        self.hidden = nn.Sequential(*layers)
+        self.final = nn.Linear(hidden_dim, 1)
+
+    def forward(self, xt):
+        out = self.hidden(xt)
+        return self.final(out)
+
+class DeepReachExact(nn.Module):
+    def __init__(self, backbone, residual, coordinate_dim=3, value_var=0.5, value_normto=0.02):
+        super().__init__() 
+        self.backbone = backbone
+        self.residual = residual
+        self.coordinate_dim = coordinate_dim
+        self.value_var = float(value_var)
+        self.value_normto = float(value_normto)
+
+    def raw_output(self, xt):
+        return self.backbone(xt).squeeze(-1)
+
+    def forward(self, xt):
+        raw = self.raw_output(xt)
+        x_net = xt[:, :self.coordinate_dim]
+        tau_net = xt[:, self.coordinate_dim]
+        tau_phys = tau_net * self.residual.T if self.residual.scale_time_to_01 else tau_net
+        x_phys = self.residual._unscale_x(x_net)
+        boundary = self.residual.target_function(x_phys)
+        V = boundary + tau_phys * (self.value_var / self.value_normto) * raw
+        return V.unsqueeze(-1)
 
 class INR_PNODE(nn.Module):
-    def __init__(self, latent_dim, decoder, pnode, loss_manager, ode_solver=odeint, method="dopri5", rtol=1e-7, atol=1e-9, device=None):
+    def __init__(
+        self,
+        latent_dim,
+        decoder,
+        pnode,
+        loss_manager,
+        value_var=0.5,
+        value_normto=0.02,
+        ode_solver=odeint,
+        method="dopri5",
+        rtol=1e-7,
+        atol=1e-9,
+        device=None,
+        
+    ):
         super().__init__()
         self.latent_dim = latent_dim
         self.decoder = decoder
@@ -190,8 +260,45 @@ class INR_PNODE(nn.Module):
         self.atol = atol
         self.device = device
 
+        self.value_var = float(value_var)
+        self.value_normto = float(value_normto)
+        
         self.alpha0 = nn.Parameter(torch.zeros(1, self.latent_dim))
 
+    def raw_decoder_output(self, x, latent):
+        raw = self.decoder(x, latent)
+        return raw.squeeze(-1) if raw.ndim > 1 else raw
+        
+    def decode_terminal_raw(self, xt_terminal):
+        num_terminal = xt_terminal.shape[0]
+        latent0 = self.alpha0.expand(num_terminal, self.latent_dim)
+        x_terminal = xt_terminal[:, :self.decoder.coordinate_dim]
+        return self.raw_decoder_output(x_terminal, latent0)
+    
+    def decode_terminal(self, xt_terminal):
+            num_terminal = xt_terminal.shape[0]
+            latent0 = self.alpha0.expand(num_terminal, self.latent_dim)
+            x_terminal = xt_terminal[:, :self.decoder.coordinate_dim]
+            return self.decoder(x_terminal, latent0)
+    
+    def compute_value_at_xt(self, xt, tau_phys):
+        latent, dlatent = self.compute_latent_and_dlatent(tau_phys)
+        latent = latent.requires_grad_(True)
+
+        x = xt[:, :self.decoder.coordinate_dim]
+        
+        raw = self.raw_decoder_output(x, latent)
+
+        x_phys = self.loss_manager.residual._unscale_x(x)
+        boundary = self.loss_manager.residual.target_function(x_phys)
+
+        tau_phys = tau_phys.reshape(-1)
+        scale = self.value_var / self.value_normto
+        V = boundary + tau_phys * scale * raw
+
+        return V.unsqueeze(-1), raw.unsqueeze(-1), latent, dlatent
+        
+    
     # returns the latents and their time derivatives at each tau qeury
     def compute_latent_and_dlatent(self, tau_queries):
         tau_queries = tau_queries.reshape(-1)
@@ -205,7 +312,7 @@ class INR_PNODE(nn.Module):
             prepend_zero = False
 
         latent_trajectory = self.ode_solver(self.pnode, self.alpha0, t_eval, rtol=self.rtol, atol=self.atol, method=self.method)[:, 0, :]
-        dlatent_trajectory = torch.stack([self.pnode(t_eval[i], latent_trajectory[i:i+1]).squeeze(0) for i in range(t_eval.shape[0])], dim=0)
+        dlatent_trajectory = self.pnode(t_eval, latent_trajectory)
 
         if prepend_zero:
             unique_latents = latent_trajectory[1:]
@@ -218,48 +325,37 @@ class INR_PNODE(nn.Module):
         dlatents = unique_dlatents[inverse_indices]
 
         return latents, dlatents
-
-    def decode_terminal(self, xt_terminal):
-        num_terminal = xt_terminal.shape[0]
-        latent0 = self.alpha0.expand(num_terminal, self.latent_dim)
-        x_terminal = xt_terminal[:, :self.decoder.coordinate_dim]
-        return self.decoder(x_terminal, latent0)
-
-    # computes the latents and dlatents at the time queries
-    # passes the spatial coordinates and the latents into the decoder
-    # to obtain the value at that coordinate and time 
-    def compute_value_at_xt(self, xt, tau_phys):
-        latent, dlatent = self.compute_latent_and_dlatent(tau_phys)
-        latent = latent.requires_grad_(True)
-        x = xt[:, :self.decoder.coordinate_dim]
-        
-        # compute value at x and latent(tau)
-        V = self.decoder(x, latent)
-
-        return V, latent, dlatent
     
     def compute_losses(self, batch, mode="train"):
         xt_interior = batch["xt_interior"].to(self.device).float().requires_grad_(True)
         tau_interior_phys = batch["tau_interior_phys"].to(self.device).float()
         xt_terminal = batch["xt_terminal"].to(self.device).float()
-        x_terminal_phys = batch["x_terminal_phys"].to(self.device).float()
     
-        V, latent, dlatent = self.compute_value_at_xt(xt_interior, tau_interior_phys)
+        V, raw, latent, dlatent = self.compute_value_at_xt(
+            xt_interior,
+            tau_interior_phys,
+        )
     
         if mode == "visualization":
             return V.detach().cpu().numpy()
     
-        V_terminal = self.decode_terminal(xt_terminal)
+        raw_terminal = None
+        if self.loss_manager.loss_weights.get("terminal", 0.0) > 0.0:
+            raw_terminal = self.decode_terminal_raw(xt_terminal)
     
-        loss_dict = self.loss_manager.compute_losses(model=self, xt_interior=xt_interior, x_terminal_phys=x_terminal_phys, V=V, V_terminal=V_terminal, latent=latent, dlatent=dlatent)
-    
-        loss_train = (self.loss_manager.loss_weights["terminal"] * loss_dict["loss_terminal"] + self.loss_manager.loss_weights["pinn"] * loss_dict["loss_pinn"])
-        loss_dict["loss_train"] = loss_train
-        return loss_dict
+        return self.loss_manager.compute_losses(
+            model=self,
+            xt_interior=xt_interior,
+            V=V,
+            raw=raw,
+            raw_terminal=raw_terminal,
+            latent=latent,
+            dlatent=dlatent,
+        )
 
     def create_optimizers(self, lr=1e-4, ode_lr=None):
         if ode_lr is None:
-            ode_lr = lr/10
+            ode_lr = lr
 
         return {
             "optim_decoder": torch.optim.Adam(self.decoder.parameters(), lr=lr),
