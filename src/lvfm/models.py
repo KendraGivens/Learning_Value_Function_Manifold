@@ -30,7 +30,7 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.model(x) 
 
-class PNODE(nn.Module):
+class PNODE_Siren(nn.Module):
     def __init__(self, latent_dim, hidden_dim, num_layers=3, omega0=15.0):
         super().__init__()
         self.latent_dim = latent_dim
@@ -55,20 +55,20 @@ class PNODE(nn.Module):
         out = self.hidden(inputs)
         return self.final(out)
 
-# class PNODE(nn.Module):
-#     def __init__(self, latent_dim, hidden_dim, num_layers=3, activation_fn=Swish):
-#         super().__init__()
-#         self.model = MLP(in_dim=latent_dim+1, hidden_dim=hidden_dim, activation_fn=activation_fn, out_dim=latent_dim)
+class PNODE_MLP(nn.Module):
+    def __init__(self, latent_dim, hidden_dim, num_layers=3, activation_fn=Swish):
+        super().__init__()
+        self.model = MLP(in_dim=latent_dim+1, hidden_dim=hidden_dim, activation_fn=activation_fn, out_dim=latent_dim)
 
-#     def forward(self, t, latent_state):
-#         if not torch.is_tensor(t):
-#             t = torch.tensor(t, dtype=latent_state.dtype, device=latent_state.device)
-#         if t.ndim == 0:
-#             t_expanded = t.expand(latent_state.shape[:-1] + (1,))
-#         else:
-#             t_expanded = t[..., None].expand(latent_state.shape[:-1] + (1,))
-#         inputs = torch.cat([latent_state, t_expanded], dim=-1)
-#         return self.model(inputs)
+    def forward(self, t, latent_state):
+        if not torch.is_tensor(t):
+            t = torch.tensor(t, dtype=latent_state.dtype, device=latent_state.device)
+        if t.ndim == 0:
+            t_expanded = t.expand(latent_state.shape[:-1] + (1,))
+        else:
+            t_expanded = t[..., None].expand(latent_state.shape[:-1] + (1,))
+        inputs = torch.cat([latent_state, t_expanded], dim=-1)
+        return self.model(inputs)
 
 # takes in inputs and latent state alpha
 # returns the learned linear projection of the inputs and latent state
@@ -351,6 +351,9 @@ class INR_PNODE(nn.Module):
             raw_terminal=raw_terminal,
             latent=latent,
             dlatent=dlatent,
+            causal_loss=getattr(self, "causal_loss", False),
+            causal_chunks=getattr(self, "causal_chunks", 16),
+            causal_eps=getattr(self, "causal_eps", 1.0),
         )
 
     def create_optimizers(self, lr=1e-4, ode_lr=None):

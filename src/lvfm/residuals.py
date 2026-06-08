@@ -265,3 +265,140 @@ class Air3DResidual(HJVIResidualBase):
         disturbance_term = -self.disturbance_bound * torch.abs(ppsi)
 
         return base + control_term + disturbance_term
+
+class Air6DJointResidual(HJVIResidualBase):
+    def __init__(
+        self,
+        vp=0.75,
+        ve=0.75,
+        control_bound=3.0,
+        disturbance_bound=3.0,
+        radius=0.25,
+        T=1.0,
+        x_bounds=(-1.0, 1.0),
+        y_bounds=(-1.0, 1.0),
+        theta_bounds=(-math.pi, math.pi),
+        scale_to_minus1_1=True,
+        scale_time_to_01=True,
+        angle_alpha_factor=1.2,
+    ):
+        super().__init__(
+            coordinate_dim=6,
+            radius=radius,
+            T=T,
+            scale_to_minus1_1=scale_to_minus1_1,
+            scale_time_to_01=scale_time_to_01,
+        )
+
+        self.vp = float(vp)
+        self.ve = float(ve)
+        self.control_bound = float(control_bound)
+        self.disturbance_bound = float(disturbance_bound)
+
+        self.x_bounds = tuple(x_bounds)
+        self.y_bounds = tuple(y_bounds)
+        self.theta_bounds = tuple(theta_bounds)
+
+        self.angle_alpha_factor = float(angle_alpha_factor)
+        self.angle_scale = self.angle_alpha_factor * math.pi
+
+    def target_function(self, x_phys):
+        xp = x_phys[..., 0]
+        yp = x_phys[..., 1]
+
+        xe = x_phys[..., 3]
+        ye = x_phys[..., 4]
+
+        dist = torch.sqrt((xp - xe) ** 2 + (yp - ye) ** 2 + 1e-12)
+        return dist - self.radius
+
+    def _unscale_x(self, x_net):
+        if not self.scale_to_minus1_1:
+            return x_net
+
+        x_phys = x_net.clone()
+
+        # pursuer x, y
+        x_phys[..., 0] = 0.5 * (x_net[..., 0] + 1.0) * (
+            self.x_bounds[1] - self.x_bounds[0]
+        ) + self.x_bounds[0]
+
+        x_phys[..., 1] = 0.5 * (x_net[..., 1] + 1.0) * (
+            self.y_bounds[1] - self.y_bounds[0]
+        ) + self.y_bounds[0]
+
+        # pursuer heading
+        x_phys[..., 2] = x_net[..., 2] * self.angle_scale
+
+        # evader x, y
+        x_phys[..., 3] = 0.5 * (x_net[..., 3] + 1.0) * (
+            self.x_bounds[1] - self.x_bounds[0]
+        ) + self.x_bounds[0]
+
+        x_phys[..., 4] = 0.5 * (x_net[..., 4] + 1.0) * (
+            self.y_bounds[1] - self.y_bounds[0]
+        ) + self.y_bounds[0]
+
+        # evader heading
+        x_phys[..., 5] = x_net[..., 5] * self.angle_scale
+
+        return x_phys
+
+    def _unscale_spatial_gradient(self, spatial_grad):
+        if not self.scale_to_minus1_1:
+            return spatial_grad
+
+        grad = spatial_grad.clone()
+
+        # dV/dx_p, dV/dy_p
+        grad[..., 0] = spatial_grad[..., 0] * (
+            2.0 / (self.x_bounds[1] - self.x_bounds[0])
+        )
+
+        grad[..., 1] = spatial_grad[..., 1] * (
+            2.0 / (self.y_bounds[1] - self.y_bounds[0])
+        )
+
+        # dV/dtheta_p
+        grad[..., 2] = spatial_grad[..., 2] / self.angle_scale
+
+        # dV/dx_e, dV/dy_e
+        grad[..., 3] = spatial_grad[..., 3] * (
+            2.0 / (self.x_bounds[1] - self.x_bounds[0])
+        )
+
+        grad[..., 4] = spatial_grad[..., 4] * (
+            2.0 / (self.y_bounds[1] - self.y_bounds[0])
+        )
+
+        # dV/dtheta_e
+        grad[..., 5] = spatial_grad[..., 5] / self.angle_scale
+
+        return grad
+
+    def compute_hamiltonian(self, x_phys, spatial_grad):
+        thp = x_phys[..., 2]
+        the = x_phys[..., 5]
+
+        p_xp = spatial_grad[..., 0]
+        p_yp = spatial_grad[..., 1]
+        p_thp = spatial_grad[..., 2]
+
+        p_xe = spatial_grad[..., 3]
+        p_ye = spatial_grad[..., 4]
+        p_the = spatial_grad[..., 5]
+
+        base = (
+            p_xp * self.vp * torch.cos(thp)
+            + p_yp * self.vp * torch.sin(thp)
+            + p_xe * self.ve * torch.cos(the)
+            + p_ye * self.ve * torch.sin(the)
+        )
+
+        # Evader control: omega_e = u, maximizing.
+        control_term = self.control_bound * torch.abs(p_the)
+
+        # Pursuer disturbance: omega_p = d, minimizing.
+        disturbance_term = -self.disturbance_bound * torch.abs(p_thp)
+
+        return base + control_term + disturbance_term

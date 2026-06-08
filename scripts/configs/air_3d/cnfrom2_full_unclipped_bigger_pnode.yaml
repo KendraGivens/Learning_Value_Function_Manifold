@@ -1,5 +1,5 @@
 coordinate_dim: 3
-latent_dim: 256
+latent_dim: 64
 
 decoder_hidden_dim: 512
 pnode_hidden_dim: 256
@@ -39,8 +39,9 @@ scale_time_to_01: true
 lr: 1.0e-4
 pretrain_steps: 2000
 steps_per_stage: 2000
-pnode_warmup_steps: 5000
 num_unique_taus: 4096
+efficent: true 
+pnode: siren
 total_steps: 10000
 save_freq: 100
 tau_schedule: [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]

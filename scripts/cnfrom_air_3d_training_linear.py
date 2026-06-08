@@ -120,6 +120,9 @@ def create_model(cfg, residual):
 
     return model
 
+def linear_tau_max(step, total_steps, T):
+    return T * float(step + 1) / float(total_steps)
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--cfg", required=True)
@@ -215,8 +218,6 @@ def main():
 
     model.loss_manager.loss_weights = {"terminal": 0.0, "pinn": 1.0}
     
-    train_dataset.set_tau_max(cfg.T)
-    
     if hasattr(cfg, "total_steps"):
         total_steps = cfg.total_steps
     else:
@@ -225,59 +226,72 @@ def main():
     if hasattr(cfg, "save_freq"):
         save_freq = cfg.save_freq
     else:
-        save_freq = cfg.steps_per_stage
+        save_freq = cfg.steps_per_stage   
     
     step = 0
+    loader_iter = iter(train_loader)
+    
     while step < total_steps:
-        for batch in train_loader:
-            for opt in optimizers.values():
-                opt.zero_grad()
+        current_tau_max = linear_tau_max(step, total_steps, cfg.T)
     
-            results = model.compute_losses(batch, mode="train")
-            results["loss_train"].backward()
-
+        train_dataset.set_tau_max(current_tau_max)
     
-            for opt in optimizers.values():
-                opt.step()
+        try:
+            batch = next(loader_iter)
+        except StopIteration:
+            loader_iter = iter(train_loader)
+            batch = next(loader_iter)
     
-            step += 1
+        for opt in optimizers.values():
+            opt.zero_grad()
     
-            if step % save_freq == 0 or step == total_steps:
-                print(f"step={step}/{total_steps}")
+        results = model.compute_losses(batch, mode="train")
+        results["loss_train"].backward()
     
-                save_checkpoint(
-                    ckpt_dir / f"step_{step:06d}.pt",
-                    model,
-                    optimizers,
-                    step=step,
-                    tau_max=cfg.T,
-                    cfg=cfg,
+        for opt in optimizers.values():
+            opt.step()
+    
+        step += 1
+    
+        if step % save_freq == 0 or step == total_steps:
+            print(
+                f"step={step}/{total_steps}, "
+                f"tau_max={current_tau_max:.6f}/{cfg.T:.6f}"
+            )
+    
+            save_checkpoint(
+                ckpt_dir / f"step_{step:06d}.pt",
+                model,
+                optimizers,
+                step=step,
+                tau_max=current_tau_max,
+                cfg=cfg,
+            )
+    
+            for i, eval_tau in enumerate(cfg.tau_schedule):
+                gt_slice = build_air3d_gt_slice(
+                    gt_values_3d=np.asarray(gt_value_function[i + 1]),
+                    psi_bounds=cfg.psi_bounds,
+                    psi_slice=cfg.psi_slice,
                 )
     
-                for i, eval_tau in enumerate(cfg.tau_schedule):
-                    gt_slice = build_air3d_gt_slice(
-                        gt_values_3d=np.asarray(gt_value_function[i + 1]),
-                        psi_bounds=cfg.psi_bounds,
-                        psi_slice=cfg.psi_slice,
-                    )
-    
-                    plot_air3d_pnode_slice(
-                        model=model,
-                        device=cfg.device,
-                        tau=eval_tau,
-                        psi_slice=cfg.psi_slice,
-                        gt_values=gt_slice,
-                        x_bounds=cfg.x_bounds,
-                        y_bounds=cfg.y_bounds,
-                        psi_bounds=cfg.psi_bounds,
-                        nx=cfg.x_discretization,
-                        chunk_size=4096,
-                        scale_to_minus1_1=cfg.scale_to_minus1_1,
-                        T=cfg.T,
-                        scale_time_to_01=cfg.scale_time_to_01,
-                        title=f"Air3D slice at tau={eval_tau:.2f}, psi={cfg.psi_slice:.2f}",
-                        save_path=plot_dir / f"compare_tau_{eval_tau:.2f}.png",
-                    )
+                plot_air3d_pnode_slice(
+                    model=model,
+                    device=cfg.device,
+                    tau=eval_tau,
+                    psi_slice=cfg.psi_slice,
+                    gt_values=gt_slice,
+                    x_bounds=cfg.x_bounds,
+                    y_bounds=cfg.y_bounds,
+                    psi_bounds=cfg.psi_bounds,
+                    nx=cfg.x_discretization,
+                    chunk_size=4096,
+                    scale_to_minus1_1=cfg.scale_to_minus1_1,
+                    T=cfg.T,
+                    scale_time_to_01=cfg.scale_time_to_01,
+                    title=f"Air3D slice at tau={eval_tau:.2f}, psi={cfg.psi_slice:.2f}",
+                    save_path=plot_dir / f"compare_tau_{eval_tau:.2f}.png",
+                )
     
             if step >= total_steps:
                 break

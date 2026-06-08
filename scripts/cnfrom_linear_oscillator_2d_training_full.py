@@ -1,6 +1,5 @@
 import os
 os.environ["JAX_PLATFORMS"] = "cpu"
-
 import argparse
 from pathlib import Path
 import shutil
@@ -12,10 +11,10 @@ from tqdm import trange
 from types import SimpleNamespace
 from torch.utils.data import DataLoader
 from torchdiffeq import odeint
-from lvfm.datasets import LinearOscillator2DDataset, LinearOscillator2DEfficentDataset
+from lvfm.datasets import LinearOscillator2DDataset
 from lvfm.residuals import LinearOscillator2DResidual
 from lvfm.managers import LossManager
-from lvfm.models import Decoder, PNODE, INR_PNODE
+from lvfm.models import Decoder, PNODE_MLP, PNODE_Siren, INR_PNODE
 from lvfm.hj_solvers import solve_linear_oscillator_2d 
 from lvfm.plotting import plot_linear_oscillator_2d
 
@@ -39,17 +38,18 @@ def save_checkpoint(path, model, optimizers, step=None, tau_max=None, cfg=None):
     torch.save(ckpt, path)
 
 def create_dataloader(cfg):     
-    train_dataset = LinearOscillator2DEfficentDataset(
+    train_dataset = LinearOscillator2DDataset(
         num_batches=cfg.num_batches,
-        num_interior= cfg.num_interior,
+        num_interior=cfg.num_interior,
         num_terminal=cfg.num_terminal,
         T=cfg.T,
         num_unique_taus=cfg.num_unique_taus,
         x1_bounds=cfg.x1_bounds,
         x2_bounds=cfg.x2_bounds,
-        tau_max=0.0,  
+        tau_max=0.0,
         scale_to_minus1_1=cfg.scale_to_minus1_1,
         scale_time_to_0_1=cfg.scale_time_to_01,
+        efficient=cfg.efficient,
     )    
     
     train_loader = DataLoader(
@@ -89,11 +89,17 @@ def create_model(cfg, residual):
         net_type=cfg.net_type,   
         input_scale=cfg.input_scale,
     )
-    
-    pnode = PNODE(
-        latent_dim=cfg.latent_dim,
-        hidden_dim=cfg.pnode_hidden_dim,
-    )
+
+    if cfg.pnode == "siren":
+        pnode = PNODE_Siren(
+            latent_dim=cfg.latent_dim,
+            hidden_dim=cfg.pnode_hidden_dim,
+        )
+    elif cfg.pnode == "mlp":
+        pnode = PNODE_MLP(
+            latent_dim=cfg.latent_dim,
+            hidden_dim=cfg.pnode_hidden_dim,
+        )
     
     model = INR_PNODE(
         latent_dim=cfg.latent_dim,
@@ -110,82 +116,6 @@ def create_model(cfg, residual):
     ).to(cfg.device)
 
     return model
-
-def sample_candidate_interior(train_dataset, n, device):
-    x_phys = train_dataset._sample_states_phys(n)
-    x_net = train_dataset._scale_states(x_phys)
-
-    tau_phys = train_dataset._sample_tau_phys(n)
-    tau_net = train_dataset._scale_tau(tau_phys)
-
-    xt = torch.cat([x_net, tau_net], dim=-1)
-
-    return {
-        "xt": xt.to(device).float().requires_grad_(True),
-        "x_phys": x_phys.to(device).float(),
-        "tau_phys": tau_phys.squeeze(-1).to(device).float(),
-    }
-
-
-def residual_weighted_pool(model, residual, train_dataset, device, num_candidates, k=1.0, c=1.0):
-    cand = sample_candidate_interior(train_dataset, num_candidates, device)
-
-    xt = cand["xt"]
-    tau_phys = cand["tau_phys"]
-
-    V, raw, latent, dlatent = model.compute_value_at_xt(xt, tau_phys)
-    r = residual.compute_residual(
-        model=model,
-        V=V,
-        raw=raw,
-        xt=xt,
-        latent=latent,
-        dlatent=dlatent,
-    )
-
-    scores = r.abs().detach()
-    weights = scores.pow(k)
-    weights = weights / (weights.mean() + c)
-
-    weight_sum = weights.sum()
-    if (not torch.isfinite(weight_sum)) or weight_sum.item() <= 0:
-        probs = torch.full_like(weights, 1.0 / weights.numel())
-    else:
-        probs = weights / weight_sum
-
-    return {
-        "xt": cand["xt"].detach().cpu(),
-        "x_phys": cand["x_phys"].detach().cpu(),
-        "tau_phys": cand["tau_phys"].detach().cpu(),
-        "scores": scores.detach().cpu(),
-        "probs": probs.detach().cpu(),
-    }
-
-
-def draw_adaptive_points(pool, num_draw):
-    idx = torch.multinomial(pool["probs"], num_samples=num_draw, replacement=True)
-    return {
-        "xt": pool["xt"][idx],
-        "x_phys": pool["x_phys"][idx],
-        "tau_phys": pool["tau_phys"][idx],
-    }
-
-
-def inject_adaptive_points(batch, adaptive_pts, hard_frac=0.25):
-    n_total = batch["xt_interior"].shape[0]
-    n_hard = int(hard_frac * n_total)
-    n_uniform = n_total - n_hard
-
-    batch["xt_interior"] = torch.cat(
-        [batch["xt_interior"][:n_uniform], adaptive_pts["xt"][:n_hard]], dim=0
-    )
-    batch["x_interior_phys"] = torch.cat(
-        [batch["x_interior_phys"][:n_uniform], adaptive_pts["x_phys"][:n_hard]], dim=0
-    )
-    batch["tau_interior_phys"] = torch.cat(
-        [batch["tau_interior_phys"][:n_uniform], adaptive_pts["tau_phys"][:n_hard]], dim=0
-    )
-    return batch
 
 def main():
     p = argparse.ArgumentParser()
@@ -235,9 +165,9 @@ def main():
             results = model.compute_losses(batch, mode="train")
             results["loss_train"].backward()
 
-            torch.nn.utils.clip_grad_norm_(model.decoder.parameters(), max_norm=1.0)
-            torch.nn.utils.clip_grad_norm_(model.pnode.parameters(), max_norm=1.0)
-            torch.nn.utils.clip_grad_norm_([model.alpha0], max_norm=1.0)
+            # torch.nn.utils.clip_grad_norm_(model.decoder.parameters(), max_norm=1.0)
+            # torch.nn.utils.clip_grad_norm_(model.pnode.parameters(), max_norm=1.0)
+            # torch.nn.utils.clip_grad_norm_([model.alpha0], max_norm=1.0)
 
             for opt in optimizers.values():
                 opt.step()
@@ -249,52 +179,24 @@ def main():
     gt_slice = np.array(ground_truth_value_function[0]).T
     plot_linear_oscillator_2d(model, device=cfg.device, tau=0.0, gt_values=gt_slice, x1_bounds=cfg.x1_bounds, x2_bounds=cfg.x2_bounds, nx=201, chunk_size=4096, scale_to_minus1_1=cfg.scale_to_minus1_1, T=cfg.T, scale_time_to_01=cfg.scale_time_to_01, title="Predicted vs Ground Truth at tau=0.00", save_path=plot_dir / "compare_tau_0.00.png")
         
-   # full-horizon training with adaptive sampling
-    model.loss_manager.loss_weights = {"terminal": 1.0, "pinn": 1.0}
-    
-    # sample tau over the whole horizon from the start
+    model.loss_manager.loss_weights = {"terminal": 0.0, "pinn": 1.0}
     train_dataset.set_tau_max(cfg.T)
     
-    # keep total optimization budget the same as staged training
-    total_steps = 20000
+    total_steps = cfg.total_steps
     save_freq = cfg.steps_per_stage
     
-    step = 0
-    adaptive_pool = None
-    
+    step = 0    
     while step < total_steps:
         for batch in train_loader:
             for opt in optimizers.values():
                 opt.zero_grad()
     
-            if getattr(cfg, "adaptive_sampling", False):
-                n_hard = int(cfg.hard_frac * batch["xt_interior"].shape[0])
-    
-                if n_hard > 0:
-                    if adaptive_pool is None or step % cfg.adaptive_every == 0:
-                        adaptive_pool = residual_weighted_pool(
-                            model=model,
-                            residual=residual,
-                            train_dataset=train_dataset,
-                            device=cfg.device,
-                            num_candidates=int(cfg.candidate_mult * n_hard),
-                            k=cfg.rad_k,
-                            c=cfg.rad_c,
-                        )
-    
-                    adaptive_pts = draw_adaptive_points(adaptive_pool, n_hard)
-                    batch = inject_adaptive_points(
-                        batch=batch,
-                        adaptive_pts=adaptive_pts,
-                        hard_frac=cfg.hard_frac,
-                    )
-    
             results = model.compute_losses(batch, mode="train")
             results["loss_train"].backward()
     
-            torch.nn.utils.clip_grad_norm_(model.decoder.parameters(), max_norm=1.0)
-            torch.nn.utils.clip_grad_norm_(model.pnode.parameters(), max_norm=1.0)
-            torch.nn.utils.clip_grad_norm_([model.alpha0], max_norm=1.0)
+            # torch.nn.utils.clip_grad_norm_(model.decoder.parameters(), max_norm=1.0)
+            # torch.nn.utils.clip_grad_norm_(model.pnode.parameters(), max_norm=1.0)
+            # torch.nn.utils.clip_grad_norm_([model.alpha0], max_norm=1.0)
     
             for opt in optimizers.values():
                 opt.step()

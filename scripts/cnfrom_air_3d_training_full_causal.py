@@ -1,6 +1,5 @@
 import os
 os.environ["JAX_PLATFORMS"] = "cpu"
-
 import argparse
 from pathlib import Path
 import shutil
@@ -12,10 +11,10 @@ from tqdm import trange
 from types import SimpleNamespace
 from torch.utils.data import DataLoader
 from torchdiffeq import odeint
-from lvfm.datasets import Air3DEfficentDataset
+from lvfm.datasets import Air3DDataset
 from lvfm.residuals import Air3DResidual
 from lvfm.managers import LossManager
-from lvfm.models import Decoder, PNODE, INR_PNODE
+from lvfm.models import Decoder, PNODE_MLP, PNODE_Siren, INR_PNODE
 from lvfm.hj_solvers import solve_air3d_relative
 from lvfm.plotting import plot_air3d_pnode_slice, build_air3d_gt_slice
 
@@ -39,7 +38,7 @@ def save_checkpoint(path, model, optimizers, step=None, tau_max=None, cfg=None):
     torch.save(ckpt, path)
 
 def create_dataloader(cfg):    
-    train_dataset = Air3DEfficentDataset(
+    train_dataset = Air3DDataset(
         num_batches=cfg.num_batches,
         num_interior=cfg.num_interior,
         num_terminal=cfg.num_terminal,
@@ -51,6 +50,7 @@ def create_dataloader(cfg):
         tau_max=0.0,
         scale_to_minus1_1=cfg.scale_to_minus1_1,
         scale_time_to_0_1=cfg.scale_time_to_01,
+        efficient=cfg.efficent
     )
     
     train_loader = DataLoader(
@@ -77,87 +77,32 @@ def create_residual(cfg):
     )
     return residual
 
-# def create_model(cfg, residual):
-#     loss_manager = LossManager(
-#         residual=residual,
-#         loss_weights={"terminal": 1.0, "pinn": 1.0},
-#     )
-    
-#     decoder = Decoder(
-#         hidden_dim=cfg.decoder_hidden_dim,
-#         latent_dim=cfg.latent_dim,
-#         coordinate_dim=cfg.coordinate_dim,
-#         out_dim=1,
-#         num_layers=cfg.decoder_num_layers,
-#         net_type=cfg.net_type,   
-#         input_scale=cfg.input_scale,
-#     )
-    
-#     pnode = PNODE(
-#         latent_dim=cfg.latent_dim,
-#         hidden_dim=cfg.pnode_hidden_dim,
-#     )
-    
-#     model = INR_PNODE(
-#         latent_dim=cfg.latent_dim,
-#         decoder=decoder,
-#         pnode=pnode,
-#         loss_manager=loss_manager,
-#         ode_solver=odeint,
-#         method=cfg.method,
-#         rtol=cfg.rtol,
-#         atol=cfg.atol,
-#         device=cfg.device,
-#     ).to(cfg.device)
-
-#     return model
-
 def create_model(cfg, residual):
     loss_manager = LossManager(
         residual=residual,
         loss_weights={"terminal": 1.0, "pinn": 1.0},
     )
 
-    # decoder = Decoder(
-    #     hidden_dim=cfg.decoder_hidden_dim,
-    #     latent_dim=cfg.latent_dim,
-    #     coordinate_dim=cfg.coordinate_dim,
-    #     out_dim=1,
-    #     num_layers=cfg.decoder_num_layers,
-    #     net_type=cfg.net_type,
-    #     input_scale=cfg.input_scale,
-    # )
-
-    decoder_input_dim = cfg.coordinate_dim + (2 if getattr(cfg, "use_trig_psi", False) else 0)
-
     decoder = Decoder(
         hidden_dim=cfg.decoder_hidden_dim,
         latent_dim=cfg.latent_dim,
-        coordinate_dim=decoder_input_dim,
+        coordinate_dim=cfg.coordinate_dim,
         out_dim=1,
         num_layers=cfg.decoder_num_layers,
         net_type=cfg.net_type,
         input_scale=cfg.input_scale,
     )
 
-    pnode = PNODE(
-        latent_dim=cfg.latent_dim,
-        hidden_dim=cfg.pnode_hidden_dim,
-    )
-
-    # model = INR_PNODE(
-    #     latent_dim=cfg.latent_dim,
-    #     decoder=decoder,
-    #     pnode=pnode,
-    #     loss_manager=loss_manager,
-    #     value_var=0.5,
-    #     value_normto=0.02,
-    #     ode_solver=odeint,
-    #     method=cfg.method,
-    #     rtol=cfg.rtol,
-    #     atol=cfg.atol,
-    #     device=cfg.device,
-    # ).to(cfg.device)
+    if cfg.pnode == "siren":
+        pnode = PNODE_Siren(
+            latent_dim=cfg.latent_dim,
+            hidden_dim=cfg.pnode_hidden_dim,
+        )
+    elif cfg.pnode == "mlp":
+        pnode = PNODE_MLP(
+            latent_dim=cfg.latent_dim,
+            hidden_dim=cfg.pnode_hidden_dim,
+        )
 
     model = INR_PNODE(
         latent_dim=cfg.latent_dim,
@@ -171,9 +116,11 @@ def create_model(cfg, residual):
         rtol=cfg.rtol,
         atol=cfg.atol,
         device=cfg.device,
-        state_dim=cfg.coordinate_dim,   # still 3 physical coords
-        use_trig_psi=getattr(cfg, "use_trig_psi", False),
     ).to(cfg.device)
+
+    model.causal_loss = getattr(cfg, "causal_loss", False)
+    model.causal_chunks = getattr(cfg, "causal_chunks", 16)
+    model.causal_eps = getattr(cfg, "causal_eps", 1.0)
 
     return model
 
@@ -209,9 +156,6 @@ def main():
     train_dataset, train_loader = create_dataloader(cfg)
     residual = create_residual(cfg)
     model = create_model(cfg, residual)
-    # last = model.pnode.model.model[-1]
-    # torch.nn.init.zeros_(last.weight)
-    # torch.nn.init.zeros_(last.bias)
     optimizers = model.create_optimizers(lr=cfg.lr)
 
     gt_value_function = solve_air3d_relative(
@@ -241,9 +185,9 @@ def main():
             results = model.compute_losses(batch, mode="train")
             results["loss_train"].backward()
 
-            torch.nn.utils.clip_grad_norm_(model.decoder.parameters(), max_norm=1.0)
-            torch.nn.utils.clip_grad_norm_(model.pnode.parameters(), max_norm=1.0)
-            torch.nn.utils.clip_grad_norm_([model.alpha0], max_norm=1.0)
+            # torch.nn.utils.clip_grad_norm_(model.decoder.parameters(), max_norm=1.0)
+            # torch.nn.utils.clip_grad_norm_(model.pnode.parameters(), max_norm=1.0)
+            # torch.nn.utils.clip_grad_norm_([model.alpha0], max_norm=1.0)
 
             for opt in optimizers.values():
                 opt.step()
@@ -276,66 +220,78 @@ def main():
         save_path=plot_dir / "compare_tau_0.00.png",
     )
 
-    # curriculum training
-    model.loss_manager.loss_weights = {"terminal": 1.0, "pinn": 1.0}
-    for i, tau_max in enumerate(cfg.tau_schedule):
-        train_dataset.set_tau_max(tau_max)
-        print(f"\nTraining with tau_max = {tau_max:.2f}")
-        step = 0
-        while step < cfg.steps_per_stage:
-            for batch in train_loader:
-                for opt in optimizers.values():
-                    opt.zero_grad()
 
-                results = model.compute_losses(batch, mode="train")
-                results["loss_train"].backward()
-
-                torch.nn.utils.clip_grad_norm_(model.decoder.parameters(), max_norm=1.0)
-                torch.nn.utils.clip_grad_norm_(model.pnode.parameters(), max_norm=1.0)
-                torch.nn.utils.clip_grad_norm_([model.alpha0], max_norm=1.0)
-
-                # results = model.compute_losses(batch, mode="train")
-
-                # cont_loss = model.continuity_loss()
-                # total_loss = results["loss_train"] + 1e-3 * cont_loss
-                
-                # total_loss.backward()
-                
-                # torch.nn.utils.clip_grad_norm_(model.decoder.parameters(), max_norm=1.0)
-                # torch.nn.utils.clip_grad_norm_(model.pnode.parameters(), max_norm=1.0)
-                # torch.nn.utils.clip_grad_norm_([model.alpha0_chunks], max_norm=1.0)
-
-                for opt in optimizers.values():
-                    opt.step()
-                    
-                step += 1
-                if step >= cfg.steps_per_stage:
-                    break
-        save_checkpoint(ckpt_dir/f"tau_{tau_max:.2f}.pt", model, optimizers, step=step, tau_max=tau_max, cfg=cfg)  
-        
-        gt_slice = build_air3d_gt_slice(
-                gt_values_3d=np.asarray(gt_value_function[i + 1]),
-                psi_bounds=cfg.psi_bounds,
-                psi_slice=cfg.psi_slice,
-            )
-
-        plot_air3d_pnode_slice(
-            model=model,
-            device=cfg.device,
-            tau=tau_max,
-            psi_slice=cfg.psi_slice,
-            gt_values=gt_slice,
-            x_bounds=cfg.x_bounds,
-            y_bounds=cfg.y_bounds,
-            psi_bounds=cfg.psi_bounds,
-            nx=cfg.x_discretization,
-            chunk_size=4096,
-            scale_to_minus1_1=cfg.scale_to_minus1_1,
-            T=cfg.T,
-            scale_time_to_01=cfg.scale_time_to_01,
-            title=f"Air3D slice at tau={tau_max:.2f}, psi={cfg.psi_slice:.2f}",
-            save_path=plot_dir / f"compare_tau_{tau_max:.2f}.png",
-        )
-        
+    model.loss_manager.loss_weights = {"terminal": 0.0, "pinn": 1.0}
+    
+    train_dataset.set_tau_max(cfg.T)
+    
+    if hasattr(cfg, "total_steps"):
+        total_steps = cfg.total_steps
+    else:
+        total_steps = cfg.steps_per_stage * len(cfg.tau_schedule)
+    
+    if hasattr(cfg, "save_freq"):
+        save_freq = cfg.save_freq
+    else:
+        save_freq = cfg.steps_per_stage
+    
+    step = 0
+    while step < total_steps:
+        for batch in train_loader:
+            for opt in optimizers.values():
+                opt.zero_grad()
+    
+            results = model.compute_losses(batch, mode="train")
+            results["loss_train"].backward()
+    
+            # torch.nn.utils.clip_grad_norm_(model.decoder.parameters(), max_norm=1.0)
+            # torch.nn.utils.clip_grad_norm_(model.pnode.parameters(), max_norm=1.0)
+            # torch.nn.utils.clip_grad_norm_([model.alpha0], max_norm=1.0)
+    
+            for opt in optimizers.values():
+                opt.step()
+    
+            step += 1
+    
+            if step % save_freq == 0 or step == total_steps:
+                print(f"step={step}/{total_steps}")
+    
+                save_checkpoint(
+                    ckpt_dir / f"step_{step:06d}.pt",
+                    model,
+                    optimizers,
+                    step=step,
+                    tau_max=cfg.T,
+                    cfg=cfg,
+                )
+    
+                for i, eval_tau in enumerate(cfg.tau_schedule):
+                    gt_slice = build_air3d_gt_slice(
+                        gt_values_3d=np.asarray(gt_value_function[i + 1]),
+                        psi_bounds=cfg.psi_bounds,
+                        psi_slice=cfg.psi_slice,
+                    )
+    
+                    plot_air3d_pnode_slice(
+                        model=model,
+                        device=cfg.device,
+                        tau=eval_tau,
+                        psi_slice=cfg.psi_slice,
+                        gt_values=gt_slice,
+                        x_bounds=cfg.x_bounds,
+                        y_bounds=cfg.y_bounds,
+                        psi_bounds=cfg.psi_bounds,
+                        nx=cfg.x_discretization,
+                        chunk_size=4096,
+                        scale_to_minus1_1=cfg.scale_to_minus1_1,
+                        T=cfg.T,
+                        scale_time_to_01=cfg.scale_time_to_01,
+                        title=f"Air3D slice at tau={eval_tau:.2f}, psi={cfg.psi_slice:.2f}",
+                        save_path=plot_dir / f"compare_tau_{eval_tau:.2f}.png",
+                    )
+    
+            if step >= total_steps:
+                break
+            
 if __name__ == "__main__":
     main()

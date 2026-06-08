@@ -8,11 +8,12 @@ import yaml
 import random
 import numpy as np
 from tqdm import trange
+import matplotlib.pyplot as plt
 from types import SimpleNamespace
 from torch.utils.data import DataLoader
 from torchdiffeq import odeint
-from lvfm.datasets import Air3DDataset
-from lvfm.residuals import Air3DResidual
+from lvfm.datasets import Air6DJointDataset
+from lvfm.residuals import Air6DJointResidual
 from lvfm.managers import LossManager
 from lvfm.models import Decoder, PNODE_MLP, PNODE_Siren, INR_PNODE
 from lvfm.hj_solvers import solve_air3d_relative
@@ -38,7 +39,7 @@ def save_checkpoint(path, model, optimizers, step=None, tau_max=None, cfg=None):
     torch.save(ckpt, path)
 
 def create_dataloader(cfg):    
-    train_dataset = Air3DDataset(
+    train_dataset = Air6DJointDataset(
         num_batches=cfg.num_batches,
         num_interior=cfg.num_interior,
         num_terminal=cfg.num_terminal,
@@ -46,11 +47,12 @@ def create_dataloader(cfg):
         num_unique_taus=cfg.num_unique_taus,
         x_bounds=cfg.x_bounds,
         y_bounds=cfg.y_bounds,
-        psi_bounds=cfg.psi_bounds,
+        theta_bounds=cfg.psi_bounds,
         tau_max=0.0,
         scale_to_minus1_1=cfg.scale_to_minus1_1,
         scale_time_to_0_1=cfg.scale_time_to_01,
-        efficient=cfg.efficent
+        efficient=getattr(cfg, "efficient", getattr(cfg, "efficent", False)),
+        angle_alpha_factor=getattr(cfg, "angle_alpha_factor", 1.2),
     )
     
     train_loader = DataLoader(
@@ -62,7 +64,7 @@ def create_dataloader(cfg):
     return train_dataset, train_loader
 
 def create_residual(cfg):
-    residual = Air3DResidual(
+    residual = Air6DJointResidual(
         vp=cfg.vp,
         ve=cfg.ve,
         control_bound=cfg.u_bound,
@@ -71,9 +73,10 @@ def create_residual(cfg):
         T=cfg.T,
         x_bounds=cfg.x_bounds,
         y_bounds=cfg.y_bounds,
-        psi_bounds=cfg.psi_bounds,
+        theta_bounds=cfg.psi_bounds,
         scale_to_minus1_1=cfg.scale_to_minus1_1,
         scale_time_to_01=cfg.scale_time_to_01,
+        angle_alpha_factor=getattr(cfg, "angle_alpha_factor", 1.2),
     )
     return residual
 
@@ -120,13 +123,185 @@ def create_model(cfg, residual):
 
     return model
 
+def scale_air6d_states_to_net(x_phys, cfg):
+    x = torch.tensor(x_phys, dtype=torch.float32)
+
+    if getattr(cfg, "scale_to_minus1_1", True):
+        angle_scale = getattr(cfg, "angle_alpha_factor", 1.2) * np.pi
+
+        # xp, yp
+        x[:, 0] = 2.0 * (x[:, 0] - cfg.x_bounds[0]) / (
+            cfg.x_bounds[1] - cfg.x_bounds[0]
+        ) - 1.0
+
+        x[:, 1] = 2.0 * (x[:, 1] - cfg.y_bounds[0]) / (
+            cfg.y_bounds[1] - cfg.y_bounds[0]
+        ) - 1.0
+
+        # theta_p
+        x[:, 2] = x[:, 2] / angle_scale
+
+        # xe, ye
+        x[:, 3] = 2.0 * (x[:, 3] - cfg.x_bounds[0]) / (
+            cfg.x_bounds[1] - cfg.x_bounds[0]
+        ) - 1.0
+
+        x[:, 4] = 2.0 * (x[:, 4] - cfg.y_bounds[0]) / (
+            cfg.y_bounds[1] - cfg.y_bounds[0]
+        ) - 1.0
+
+        # theta_e
+        x[:, 5] = x[:, 5] / angle_scale
+
+    return x
+
+
+def evaluate_air6d_projected_slice(
+    model,
+    cfg,
+    tau,
+    psi_slice,
+    nx=101,
+    device=None,
+    chunk_size=4096,
+):
+    if device is None:
+        device = cfg.device
+
+    xr = np.linspace(cfg.x_bounds[0], cfg.x_bounds[1], nx)
+    yr = np.linspace(cfg.y_bounds[0], cfg.y_bounds[1], nx)
+
+    X, Y = np.meshgrid(xr, yr, indexing="xy")
+
+    # Projection:
+    # [xp, yp, theta_p, xe, ye, theta_e]
+    # = [xr, yr, psi, 0, 0, 0]
+    pts_phys = np.stack(
+        [
+            X.reshape(-1),
+            Y.reshape(-1),
+            np.full(X.size, psi_slice),
+            np.zeros(X.size),
+            np.zeros(X.size),
+            np.zeros(X.size),
+        ],
+        axis=-1,
+    ).astype(np.float32)
+
+    x_net = scale_air6d_states_to_net(pts_phys, cfg)
+
+    tau_net = torch.full((x_net.shape[0], 1), float(tau), dtype=torch.float32)
+    if getattr(cfg, "scale_time_to_01", True):
+        tau_net = tau_net / cfg.T
+
+    xt = torch.cat([x_net, tau_net], dim=-1).to(device)
+
+    vals = []
+    model.eval()
+
+    for start in range(0, xt.shape[0], chunk_size):
+        end = min(start + chunk_size, xt.shape[0])
+
+        xt_chunk = xt[start:end]
+        tau_phys_chunk = torch.full(
+            (end - start,),
+            float(tau),
+            dtype=torch.float32,
+            device=device,
+        )
+
+        with torch.no_grad():
+            V_chunk = model.compute_value_at_xt(xt_chunk, tau_phys_chunk)[0]
+
+        vals.append(V_chunk.reshape(-1).detach().cpu().numpy())
+
+    V = np.concatenate(vals, axis=0).reshape(nx, nx)
+
+    return X, Y, V
+
+def compute_iou(V_pred, V_gt):
+    pred_set = V_pred <= 0.0
+    gt_set = V_gt <= 0.0
+
+    inter = np.logical_and(pred_set, gt_set).sum()
+    union = np.logical_or(pred_set, gt_set).sum()
+
+    return inter / max(union, 1)
+
+
+def plot_air6d_projected_comparison(
+    X,
+    Y,
+    V_pred,
+    V_gt,
+    tau,
+    psi_slice,
+    save_path,
+    title=None,
+):
+    mae = np.mean(np.abs(V_pred - V_gt))
+    iou = compute_iou(V_pred, V_gt)
+
+    vmin = min(np.nanmin(V_pred), np.nanmin(V_gt))
+    vmax = max(np.nanmax(V_pred), np.nanmax(V_gt))
+
+    if np.isclose(vmin, vmax):
+        vmax = vmin + 1e-6
+
+    levels = np.linspace(vmin, vmax, 60)
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5), constrained_layout=True)
+
+    ax = axes[0]
+    cf = ax.contourf(X, Y, V_pred, levels=levels)
+    ax.contour(X, Y, V_pred, levels=[0.0], colors="red", linewidths=2.0)
+    ax.contour(X, Y, V_gt, levels=[0.0], colors="black", linestyles="--", linewidths=2.0)
+    ax.set_title(f"6D projected prediction\nτ={tau:.2f}, ψ={psi_slice:.2f}")
+    ax.set_xlabel(r"$x_{rel}$")
+    ax.set_ylabel(r"$y_{rel}$")
+    ax.set_aspect("equal")
+    fig.colorbar(cf, ax=ax)
+
+    ax = axes[1]
+    cf = ax.contourf(X, Y, V_gt, levels=levels)
+    ax.contour(X, Y, V_gt, levels=[0.0], colors="black", linewidths=2.0)
+    ax.set_title("3D relative ground truth")
+    ax.set_xlabel(r"$x_{rel}$")
+    ax.set_ylabel(r"$y_{rel}$")
+    ax.set_aspect("equal")
+    fig.colorbar(cf, ax=ax)
+
+    ax = axes[2]
+    err = np.abs(V_pred - V_gt)
+    cf = ax.contourf(X, Y, err, levels=60)
+    ax.contour(X, Y, V_pred, levels=[0.0], colors="red", linewidths=2.0)
+    ax.contour(X, Y, V_gt, levels=[0.0], colors="black", linestyles="--", linewidths=2.0)
+    ax.set_title("Absolute error")
+    ax.set_xlabel(r"$x_{rel}$")
+    ax.set_ylabel(r"$y_{rel}$")
+    ax.set_aspect("equal")
+    fig.colorbar(cf, ax=ax)
+
+    if title is None:
+        title = (
+            f"Air6D projected to relative coordinates | "
+            f"MAE={mae:.4e}, IoU={iou:.4f}"
+        )
+
+    fig.suptitle(title)
+
+    fig.savefig(save_path, bbox_inches="tight")
+    plt.close(fig)
+
+    return mae, iou
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--cfg", required=True)
     p.add_argument("--device", type=int)
     args = p.parse_args()
     
-    cfg_path = Path("configs") / "air_3d" / f"{args.cfg}.yaml"
+    cfg_path = Path("configs") / "air_6d" / f"{args.cfg}.yaml"
     cfg = load_yaml(cfg_path)
     cfg = to_namespace(cfg)
 
@@ -142,7 +317,7 @@ def main():
     cfg.device = torch.device(f"cuda:{device_idx}")
 
     run_name = args.cfg
-    run_dir = Path("runs/air_3d") / run_name
+    run_dir = Path("runs/air_6d") / run_name
     ckpt_dir = run_dir / "ckpts"
     plot_dir = run_dir / "plots"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -180,7 +355,7 @@ def main():
 
             results = model.compute_losses(batch, mode="train")
             results["loss_train"].backward()
-            
+
             for opt in optimizers.values():
                 opt.step()
             step += 1
@@ -194,25 +369,25 @@ def main():
         psi_slice=cfg.psi_slice,
     )
 
-    plot_air3d_pnode_slice(
+    X, Y, V_pred = evaluate_air6d_projected_slice(
         model=model,
-        device=cfg.device,
+        cfg=cfg,
         tau=0.0,
         psi_slice=cfg.psi_slice,
-        gt_values=gt_slice,
-        x_bounds=cfg.x_bounds,
-        y_bounds=cfg.y_bounds,
-        psi_bounds=cfg.psi_bounds,
         nx=cfg.x_discretization,
-        chunk_size=4096,
-        scale_to_minus1_1=cfg.scale_to_minus1_1,
-        T=cfg.T,
-        scale_time_to_01=cfg.scale_time_to_01,
-        title=f"Air3D slice at tau=0.00, psi={cfg.psi_slice:.2f}",
+        device=cfg.device,
+    )
+    
+    mae, iou = plot_air6d_projected_comparison(
+        X=X,
+        Y=Y,
+        V_pred=V_pred,
+        V_gt=gt_slice,
+        tau=0.0,
+        psi_slice=cfg.psi_slice,
         save_path=plot_dir / "compare_tau_0.00.png",
     )
-
-
+    
     model.loss_manager.loss_weights = {"terminal": 0.0, "pinn": 1.0}
     
     train_dataset.set_tau_max(cfg.T)
@@ -236,7 +411,6 @@ def main():
             results = model.compute_losses(batch, mode="train")
             results["loss_train"].backward()
 
-    
             for opt in optimizers.values():
                 opt.step()
     
@@ -260,25 +434,28 @@ def main():
                         psi_bounds=cfg.psi_bounds,
                         psi_slice=cfg.psi_slice,
                     )
-    
-                    plot_air3d_pnode_slice(
+                
+                    X, Y, V_pred = evaluate_air6d_projected_slice(
                         model=model,
-                        device=cfg.device,
+                        cfg=cfg,
                         tau=eval_tau,
                         psi_slice=cfg.psi_slice,
-                        gt_values=gt_slice,
-                        x_bounds=cfg.x_bounds,
-                        y_bounds=cfg.y_bounds,
-                        psi_bounds=cfg.psi_bounds,
                         nx=cfg.x_discretization,
-                        chunk_size=4096,
-                        scale_to_minus1_1=cfg.scale_to_minus1_1,
-                        T=cfg.T,
-                        scale_time_to_01=cfg.scale_time_to_01,
-                        title=f"Air3D slice at tau={eval_tau:.2f}, psi={cfg.psi_slice:.2f}",
+                        device=cfg.device,
+                    )
+                
+                    mae, iou = plot_air6d_projected_comparison(
+                        X=X,
+                        Y=Y,
+                        V_pred=V_pred,
+                        V_gt=gt_slice,
+                        tau=eval_tau,
+                        psi_slice=cfg.psi_slice,
                         save_path=plot_dir / f"compare_tau_{eval_tau:.2f}.png",
                     )
-    
+                
+                    print(f"tau={eval_tau:.2f} projected MAE={mae:.4e}, IoU={iou:.4f}")    
+                    
             if step >= total_steps:
                 break
             

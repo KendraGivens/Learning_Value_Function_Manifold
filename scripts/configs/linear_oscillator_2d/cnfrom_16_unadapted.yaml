@@ -28,15 +28,10 @@ num_unique_taus: 16
 scale_to_minus1_1: true
 scale_time_to_01: true
 
-lr: 1.0e-4
+lr: 1.0e-3
 net_type: siren
+pnode: mlp
 pretrain_steps: 2000
 steps_per_stage: 500
+efficient: true
 tau_schedule: [0.05, 0.1, 0.2, 0.4, 0.7, 1.0]
-
-adaptive_sampling: true
-hard_frac: 0.10
-adaptive_every: 25
-candidate_mult: 4
-rad_k: 1.0
-rad_c: 1.0
